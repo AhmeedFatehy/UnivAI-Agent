@@ -2,13 +2,13 @@ name: Add issue to UnivAI project board
 
 on:
   issues:
-    types: [opened, reopened, labeled, unlabeled]
+    types: [opened, reopened, closed, labeled, unlabeled]
 
 jobs:
   sync-project:
     runs-on: ubuntu-latest
     # for label events, only react to the 'note' label itself
-    if: github.event.action == 'opened' || github.event.action == 'reopened' || github.event.label.name == 'note'
+    if: github.event.action != 'labeled' && github.event.action != 'unlabeled' || github.event.label.name == 'note'
     steps:
       - name: Sync issue with project (issues labeled 'note' stay off the board)
         run: |
@@ -48,6 +48,20 @@ jobs:
             -f project="$PROJECT_ID" -f item="$ISSUE_NODE_ID" \
             --jq '.data.addProjectV2ItemById.item.id')
 
+          # Status: open issues -> Todo, closed issues -> Done
+          if [ "$ISSUE_STATE" = "closed" ]; then
+            STATUS_OPTION=$STATUS_DONE
+          else
+            STATUS_OPTION=$STATUS_TODO
+          fi
+          gh api graphql \
+            -f query='mutation($project: ID!, $item: ID!, $field: ID!, $opt: String!) {
+              updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $opt}}) {
+                projectV2Item { id }
+              }
+            }' \
+            -f project="$PROJECT_ID" -f item="$ITEM_ID" -f field="$STATUS_FIELD_ID" -f opt="$STATUS_OPTION"
+
           case "$GITHUB_REPOSITORY" in
             DevAbdoTolba/UnivAI)                  OPTION_ID=12ddabef ;; # Core
             abdalrahmanalirajab/UnivAI-app)       OPTION_ID=592b7957 ;; # App
@@ -70,5 +84,9 @@ jobs:
           GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
           PROJECT_ID: PVT_kwHOBfdr4s4Bdk1_
           FIELD_ID: PVTSSF_lAHOBfdr4s4Bdk1_zhYF0NI
+          STATUS_FIELD_ID: PVTSSF_lAHOBfdr4s4Bdk1_zhYFbD8
+          STATUS_TODO: 01f8297f
+          STATUS_DONE: 4449b784
           ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
+          ISSUE_STATE: ${{ github.event.issue.state }}
           LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
