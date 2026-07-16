@@ -1,0 +1,15 @@
+name: Add issue to UnivAI project board
+
+on:
+  issues:
+    types: [opened, reopened]
+
+jobs:
+  add-to-project:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add issue to project
+        run: gh project item-add 14 --owner DevAbdoTolba --url "$ISSUE_URL"
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
