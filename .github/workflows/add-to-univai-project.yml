@@ -8,16 +8,37 @@ jobs:
   add-to-project:
     runs-on: ubuntu-latest
     steps:
-      - name: Add issue to project
+      - name: Add issue to project and stamp Component
         run: |
-          gh api graphql \
+          ITEM_ID=$(gh api graphql \
             -f query='mutation($project: ID!, $item: ID!) {
               addProjectV2ItemById(input: {projectId: $project, contentId: $item}) {
                 item { id }
               }
             }' \
-            -f project="$PROJECT_ID" -f item="$ISSUE_NODE_ID"
+            -f project="$PROJECT_ID" -f item="$ISSUE_NODE_ID" \
+            --jq '.data.addProjectV2ItemById.item.id')
+
+          case "$GITHUB_REPOSITORY" in
+            DevAbdoTolba/UnivAI)                  OPTION_ID=12ddabef ;; # Core
+            abdalrahmanalirajab/UnivAI-app)       OPTION_ID=592b7957 ;; # App
+            AhmedSamirKhalaf/UnivAI-exam_system)  OPTION_ID=3f59d2a3 ;; # Exam system
+            AhmeedFatehy/UnivAI-Agent)            OPTION_ID=21f71b55 ;; # Agent
+            muhameedhanyyy/UnivAI-live)           OPTION_ID=63813ec9 ;; # Live
+            *)                                    OPTION_ID= ;;
+          esac
+
+          if [ -n "$OPTION_ID" ]; then
+            gh api graphql \
+              -f query='mutation($project: ID!, $item: ID!, $field: ID!, $opt: String!) {
+                updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $opt}}) {
+                  projectV2Item { id }
+                }
+              }' \
+              -f project="$PROJECT_ID" -f item="$ITEM_ID" -f field="$FIELD_ID" -f opt="$OPTION_ID"
+          fi
         env:
           GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
           PROJECT_ID: PVT_kwHOBfdr4s4Bdk1_
+          FIELD_ID: PVTSSF_lAHOBfdr4s4Bdk1_zhYF0NI
           ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
