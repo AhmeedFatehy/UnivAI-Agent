@@ -9,7 +9,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Add issue to project
-        run: gh project item-add 14 --owner DevAbdoTolba --url "$ISSUE_URL"
+        run: |
+          gh api graphql \
+            -f query='mutation($project: ID!, $item: ID!) {
+              addProjectV2ItemById(input: {projectId: $project, contentId: $item}) {
+                item { id }
+              }
+            }' \
+            -f project="$PROJECT_ID" -f item="$ISSUE_NODE_ID"
         env:
           GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
-          ISSUE_URL: ${{ github.event.issue.html_url }}
+          PROJECT_ID: PVT_kwHOBfdr4s4Bdk1_
+          ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
