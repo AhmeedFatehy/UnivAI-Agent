@@ -2,14 +2,43 @@ name: Add issue to UnivAI project board
 
 on:
   issues:
-    types: [opened, reopened]
+    types: [opened, reopened, labeled, unlabeled]
 
 jobs:
-  add-to-project:
+  sync-project:
     runs-on: ubuntu-latest
+    # for label events, only react to the 'note' label itself
+    if: github.event.action == 'opened' || github.event.action == 'reopened' || github.event.label.name == 'note'
     steps:
-      - name: Add issue to project and stamp Component
+      - name: Sync issue with project (issues labeled 'note' stay off the board)
         run: |
+          case ",$LABELS," in
+            *,note,*) HAS_NOTE=true ;;
+            *)        HAS_NOTE=false ;;
+          esac
+
+          if [ "$HAS_NOTE" = "true" ]; then
+            ITEM_ID=$(gh api graphql \
+              -f query='query($issue: ID!) {
+                node(id: $issue) {
+                  ... on Issue { projectItems(first: 20) { nodes { id project { id } } } }
+                }
+              }' \
+              -f issue="$ISSUE_NODE_ID" \
+              | jq -r --arg p "$PROJECT_ID" '.data.node.projectItems.nodes[] | select(.project.id == $p) | .id')
+            if [ -n "$ITEM_ID" ]; then
+              gh api graphql \
+                -f query='mutation($project: ID!, $item: ID!) {
+                  deleteProjectV2Item(input: {projectId: $project, itemId: $item}) { deletedItemId }
+                }' \
+                -f project="$PROJECT_ID" -f item="$ITEM_ID"
+              echo "note label present -> removed from board"
+            else
+              echo "note label present -> not on board, nothing to do"
+            fi
+            exit 0
+          fi
+
           ITEM_ID=$(gh api graphql \
             -f query='mutation($project: ID!, $item: ID!) {
               addProjectV2ItemById(input: {projectId: $project, contentId: $item}) {
@@ -42,3 +71,4 @@ jobs:
           PROJECT_ID: PVT_kwHOBfdr4s4Bdk1_
           FIELD_ID: PVTSSF_lAHOBfdr4s4Bdk1_zhYF0NI
           ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
+          LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
