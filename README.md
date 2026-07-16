@@ -27,6 +27,7 @@ Needs **Qdrant on :6333** (the UnivAI repo's `make up` starts it).
 | Folder / file | What |
 |---|---|
 | `mcp_server.py` | the MCP entry point the other services call |
+| `generation/` | course generation: `lecture_gen.py` turns the indexed book into slides + narration + quiz JSON per week (Brain makes JSON, the other caves eat it) |
 | `document_processing/` | parsing + chunking |
 | `vector_store/` | embedding + Qdrant indexing |
 | `retrieval/` | search + reranking |
