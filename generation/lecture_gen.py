@@ -351,8 +351,10 @@ def generate_quiz(
 # ---------------------------------------------------------------- writing files
 
 
-def write_week(week: int, lecture: dict, quiz: list[dict]) -> None:
-    folder = LECTURES_DIR / f"week-{week}"
+def write_week(sid: str, week: int, lecture: dict, quiz: list[dict]) -> None:
+    # Per-student course layout: lectures/<studentId>/week-N/ (matches the app's
+    # lib/lectures.ts and the UnivAI-live worker).
+    folder = LECTURES_DIR / sid / f"week-{week}"
     folder.mkdir(parents=True, exist_ok=True)
     title = lecture["title"].strip()
 
@@ -399,9 +401,11 @@ def write_week(week: int, lecture: dict, quiz: list[dict]) -> None:
     )
 
 
-def build_slides() -> None:
+def build_slides(sid: str) -> None:
+    # sid tells the builder to read lectures/<sid>/week-N/slides.md and emit the
+    # decks under public/slides/<sid>/week-N/.
     result = subprocess.run(
-        ["node", str(ROOT / "scripts" / "build-slides.mjs")],
+        ["node", str(ROOT / "scripts" / "build-slides.mjs"), sid],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -411,11 +415,12 @@ def build_slides() -> None:
         raise RuntimeError(f"slidev build failed: {result.stderr[-800:]}")
 
 
-def prerender_voice() -> None:
+def prerender_voice(sid: str) -> None:
     """Record the whole lecture to disk (UnivAI-live/prerender_audio.py — the
-    Mouth cave's job) in a subprocess, so the TTS memory returns when done."""
+    Mouth cave's job) in a subprocess, so the TTS memory returns when done.
+    sid scopes it to this student's lectures/<sid>/week-N/audio/."""
     result = subprocess.run(
-        [sys.executable, str(ROOT / "UnivAI-live" / "prerender_audio.py")],
+        [sys.executable, str(ROOT / "UnivAI-live" / "prerender_audio.py"), sid],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -429,15 +434,15 @@ def prerender_voice() -> None:
 # ---------------------------------------------------------------- main
 
 
-def regenerate_quizzes(book_id: int, weeks: list[list[tuple[int, str]]]) -> None:
+def regenerate_quizzes(sid: str, book_id: int, weeks: list[list[tuple[int, str]]]) -> None:
     """Rewrite only quiz.json per week, from the ALREADY generated lecture scripts."""
     for week, week_pages in enumerate(weeks, start=1):
         script = json.loads(
-            (LECTURES_DIR / f"week-{week}" / "script.json").read_text("utf-8")
+            (LECTURES_DIR / sid / f"week-{week}" / "script.json").read_text("utf-8")
         )
         progress(book_id, f"Rewriting quiz {week} of {WEEKS} — “{script['title']}”…")
         quiz = generate_quiz(script["title"], script["segments"], week_pages)
-        (LECTURES_DIR / f"week-{week}" / "quiz.json").write_text(
+        (LECTURES_DIR / sid / f"week-{week}" / "quiz.json").write_text(
             json.dumps(
                 {"week": week, "title": script["title"], "questions": quiz},
                 indent=2,
@@ -456,8 +461,14 @@ def main() -> int:
     book_id = int(sys.argv[2])
     quizzes_only = "--quizzes-only" in sys.argv[3:]
 
-    if not fetch_one("SELECT id FROM books WHERE id = %s", (book_id,)):
+    book = fetch_one("SELECT id, student_id FROM books WHERE id = %s", (book_id,))
+    if not book:
         print(json.dumps({"ok": False, "error": f"no book with id {book_id}"}))
+        return 2
+    # The owner. Every write below is namespaced to this student (disk + DB).
+    sid = book.get("student_id")
+    if not sid:
+        print(json.dumps({"ok": False, "error": f"book {book_id} has no owner (student_id)"}))
         return 2
 
     # The admin's size dial. Set on the admin page, honoured here.
@@ -475,7 +486,7 @@ def main() -> int:
         weeks = split_weeks(pages)
 
         if quizzes_only:
-            regenerate_quizzes(book_id, weeks)
+            regenerate_quizzes(sid, book_id, weeks)
             execute(
                 "UPDATE books SET status = 'ready', progress = %s WHERE id = %s",
                 (f"Quizzes rewritten — {WEEKS} weeks.", book_id),
@@ -492,17 +503,17 @@ def main() -> int:
                 {"text": slide["narration"]} for slide in lecture["slides"]
             ]
             quiz = generate_quiz(lecture["title"], spoken, week_pages)
-            write_week(week, lecture, quiz)
+            write_week(sid, week, lecture, quiz)
             execute(
-                "UPDATE lectures SET title = %s WHERE week = %s",
-                (lecture["title"].strip(), week),
+                "UPDATE lectures SET title = %s WHERE week = %s AND student_id = %s",
+                (lecture["title"].strip(), week, sid),
             )
 
         progress(book_id, "Building the slide decks…")
-        build_slides()
+        build_slides(sid)
 
         progress(book_id, "Recording the lecturer's voice…")
-        prerender_voice()
+        prerender_voice(sid)
 
         execute(
             "UPDATE books SET status = 'ready', progress = %s WHERE id = %s",
