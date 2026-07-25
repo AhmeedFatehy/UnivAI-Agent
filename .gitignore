@@ -16,6 +16,7 @@ venv.bak/
 qdrant_storage/
 vector_store/storage/
 documents/
+fastembed_cache/
 *.db
 *.sqlite3
 
