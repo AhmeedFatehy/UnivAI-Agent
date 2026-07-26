@@ -1,92 +1,20 @@
-name: Add issue to UnivAI project board
+name: Add issue to UnivAI project
 
 on:
   issues:
-    types: [opened, reopened, closed, labeled, unlabeled]
+    types: [opened, reopened, transferred, labeled]
+
+permissions:
+  contents: read
+  issues: read
 
 jobs:
-  sync-project:
+  add-to-project:
+    if: ${{ !contains(github.event.issue.labels.*.name, 'note') }}
     runs-on: ubuntu-latest
-    # for label events, only react to the 'note' label itself
-    if: github.event.action != 'labeled' && github.event.action != 'unlabeled' || github.event.label.name == 'note'
     steps:
-      - name: Sync issue with project (issues labeled 'note' stay off the board)
-        run: |
-          case ",$LABELS," in
-            *,note,*) HAS_NOTE=true ;;
-            *)        HAS_NOTE=false ;;
-          esac
-
-          if [ "$HAS_NOTE" = "true" ]; then
-            ITEM_ID=$(gh api graphql \
-              -f query='query($issue: ID!) {
-                node(id: $issue) {
-                  ... on Issue { projectItems(first: 20) { nodes { id project { id } } } }
-                }
-              }' \
-              -f issue="$ISSUE_NODE_ID" \
-              | jq -r --arg p "$PROJECT_ID" '.data.node.projectItems.nodes[] | select(.project.id == $p) | .id')
-            if [ -n "$ITEM_ID" ]; then
-              gh api graphql \
-                -f query='mutation($project: ID!, $item: ID!) {
-                  deleteProjectV2Item(input: {projectId: $project, itemId: $item}) { deletedItemId }
-                }' \
-                -f project="$PROJECT_ID" -f item="$ITEM_ID"
-              echo "note label present -> removed from board"
-            else
-              echo "note label present -> not on board, nothing to do"
-            fi
-            exit 0
-          fi
-
-          ITEM_ID=$(gh api graphql \
-            -f query='mutation($project: ID!, $item: ID!) {
-              addProjectV2ItemById(input: {projectId: $project, contentId: $item}) {
-                item { id }
-              }
-            }' \
-            -f project="$PROJECT_ID" -f item="$ISSUE_NODE_ID" \
-            --jq '.data.addProjectV2ItemById.item.id')
-
-          # Status: open issues -> Todo, closed issues -> Done
-          if [ "$ISSUE_STATE" = "closed" ]; then
-            STATUS_OPTION=$STATUS_DONE
-          else
-            STATUS_OPTION=$STATUS_TODO
-          fi
-          gh api graphql \
-            -f query='mutation($project: ID!, $item: ID!, $field: ID!, $opt: String!) {
-              updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $opt}}) {
-                projectV2Item { id }
-              }
-            }' \
-            -f project="$PROJECT_ID" -f item="$ITEM_ID" -f field="$STATUS_FIELD_ID" -f opt="$STATUS_OPTION"
-
-          case "$GITHUB_REPOSITORY" in
-            DevAbdoTolba/UnivAI)                  OPTION_ID=12ddabef ;; # Core
-            abdalrahmanalirajab/UnivAI-app)       OPTION_ID=592b7957 ;; # App
-            AhmedSamirKhalaf/UnivAI-exam_system)  OPTION_ID=3f59d2a3 ;; # Exam system
-            AhmeedFatehy/UnivAI-Agent)            OPTION_ID=21f71b55 ;; # Agent
-            muhameedhanyyy/UnivAI-live)           OPTION_ID=63813ec9 ;; # Live
-            *)                                    OPTION_ID= ;;
-          esac
-
-          if [ -n "$OPTION_ID" ]; then
-            gh api graphql \
-              -f query='mutation($project: ID!, $item: ID!, $field: ID!, $opt: String!) {
-                updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $opt}}) {
-                  projectV2Item { id }
-                }
-              }' \
-              -f project="$PROJECT_ID" -f item="$ITEM_ID" -f field="$FIELD_ID" -f opt="$OPTION_ID"
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
-          PROJECT_ID: PVT_kwHOBfdr4s4Bdk1_
-          FIELD_ID: PVTSSF_lAHOBfdr4s4Bdk1_zhYF0NI
-          STATUS_FIELD_ID: PVTSSF_lAHOBfdr4s4Bdk1_zhYFbD8
-          STATUS_TODO: 01f8297f
-          STATUS_DONE: 4449b784
-          ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
-          ISSUE_STATE: ${{ github.event.issue.state }}
-          LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+      - name: Add issue to project
+        uses: actions/add-to-project@5afcf98fcd03f1c2f92c3c83f58ae24323cc57fd # v2.0.0
+        with:
+          project-url: ${{ vars.UNIVAI_PROJECT_URL }}
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
