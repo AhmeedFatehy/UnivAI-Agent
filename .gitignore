@@ -35,3 +35,5 @@ coverage.xml
 
 # MacOS
 .DS_Store
+.standalone/
+__pycache__/

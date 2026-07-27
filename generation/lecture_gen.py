@@ -23,6 +23,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(AGENT_ROOT))
+
 # Model output lands in log prints; on Windows a redirected stdout defaults to
 # cp1252 and one "≤" in a reply kills the whole course build.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -30,14 +34,39 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # The Brain cave is checked out inside the UnivAI campus repo; the shared
 # plumbing (db, LLM adapter) lives there in services/.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "services"))
-
-from common.db import execute, fetch_one  # noqa: E402
-from common.llm import complete, LLMError  # noqa: E402
-
 ROOT = Path(__file__).resolve().parents[2]  # the UnivAI campus root
 LECTURES_DIR = ROOT / "lectures"
 WEEKS = 4
+execute = None
+fetch_one = None
+complete = None
+LLMError = RuntimeError
+
+
+def load_integrated_dependencies() -> None:
+    """Load parent-owned services only for the explicit integrated command."""
+    global execute, fetch_one, complete, LLMError, ROOT, LECTURES_DIR
+    configured = os.getenv("UNIVAI_INTEGRATION_ROOT")
+    ROOT = (
+        Path(configured).expanduser().resolve()
+        if configured
+        else Path(__file__).resolve().parents[2]
+    )
+    services = ROOT / "services"
+    if not (services / "common").is_dir():
+        raise RuntimeError(
+            f"Integrated services were not found under {ROOT}. "
+            "Set UNIVAI_INTEGRATION_ROOT to the main UnivAI checkout."
+        )
+    sys.path.insert(0, str(services))
+    from common.db import execute as db_execute, fetch_one as db_fetch_one
+    from common.llm import LLMError as SharedLLMError, complete as llm_complete
+
+    execute = db_execute
+    fetch_one = db_fetch_one
+    complete = llm_complete
+    LLMError = SharedLLMError
+    LECTURES_DIR = Path(os.getenv("LECTURES_DIR", str(ROOT / "lectures"))).resolve()
 
 # The course size dial (settings.course_size, set from the admin page). One
 # knob scales the lecture and the quiz bank together. The app holds the SAME
@@ -454,6 +483,40 @@ def regenerate_quizzes(sid: str, book_id: int, weeks: list[list[tuple[int, str]]
 
 
 def main() -> int:
+    if "--standalone" in sys.argv[1:]:
+        import argparse
+
+        os.environ["UNIVAI_MODE"] = "standalone"
+        from runtime import runtime_mode, standalone_root
+        from standalone_generation import generate_course
+
+        runtime_mode()
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--standalone", action="store_true")
+        parser.add_argument(
+            "--source",
+            type=Path,
+            default=AGENT_ROOT / "fixtures" / "sample_course.md",
+        )
+        parser.add_argument("--output-root", type=Path)
+        args = parser.parse_args()
+        source = args.source.resolve()
+        output = args.output_root.resolve() if args.output_root else standalone_root() / "output"
+        generate_course(source, output)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "mode": "standalone",
+                    "weeks": WEEKS,
+                    "output": str(output),
+                    "side_effects": "database, Slidev, and voice prerender skipped",
+                }
+            )
+        )
+        return 0
+
+    load_integrated_dependencies()
     if len(sys.argv) < 3:
         print(json.dumps({"ok": False, "error": "usage: lecture_gen.py <pdf_path> <book_id> [--quizzes-only]"}))
         return 2

@@ -6,6 +6,7 @@ import os
 import json
 from mcp.server.fastmcp import FastMCP
 
+from runtime import RuntimeMode, runtime_mode
 from retrieval.pipeline import retrieve_formatted
 from document_processing.loaders import load_document
 from document_processing.chunking import chunk_documents
@@ -13,8 +14,13 @@ from vector_store.indexing import index_chunks
 from vector_store.collection_manager import list_user_documents, delete_document
 from evaluation.metrics import evaluate_retrieval
 
-# Create the MCP server instance
-mcp = FastMCP("rag-module")
+# Create the MCP server instance. The defaults preserve the integrated contract;
+# environment overrides let bounded standalone smoke tests avoid occupied ports.
+mcp = FastMCP(
+    "rag-module",
+    host=os.environ.get("FASTMCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("FASTMCP_PORT", "8000")),
+)
 
 
 @mcp.tool()
@@ -37,6 +43,10 @@ def retrieve_context(
         use_query_transform: Whether to decompose complex queries into sub-queries.
     """
     try:
+        if runtime_mode() is RuntimeMode.STANDALONE:
+            from standalone_store import retrieve
+
+            return retrieve(query, user_id, limit)
         return retrieve_formatted(
             query=query,
             user_id=user_id,
@@ -57,6 +67,16 @@ def ingest_file(file_path: str, user_id: str) -> str:
         user_id: The ID of the user/student uploading the file.
     """
     try:
+        if runtime_mode() is RuntimeMode.STANDALONE:
+            from standalone_store import ingest
+
+            result = ingest(file_path, user_id)
+            filename = os.path.basename(file_path)
+            return (
+                f"Successfully ingested {filename}. Created "
+                f"{result['chunks_indexed']} chunks. Document ID: "
+                f"{result['document_id']}"
+            )
         # 1. Load
         docs = load_document(file_path)
         if not docs:
@@ -89,6 +109,13 @@ def list_documents(user_id: str) -> str:
         user_id: The ID of the user/student.
     """
     try:
+        if runtime_mode() is RuntimeMode.STANDALONE:
+            from standalone_store import list_documents as standalone_list
+
+            docs = standalone_list(user_id)
+            if not docs:
+                return f"No documents found for user '{user_id}'."
+            return json.dumps(docs, indent=2)
         docs = list_user_documents(user_id)
         if not docs:
             return f"No documents found for user '{user_id}'."
@@ -107,6 +134,11 @@ def remove_document(user_id: str, document_id: str) -> str:
         document_id: The UUID of the document to delete (get this from list_documents).
     """
     try:
+        if runtime_mode() is RuntimeMode.STANDALONE:
+            from standalone_store import remove
+
+            deleted = remove(user_id, document_id)
+            return f"Successfully deleted document '{document_id}'. Removed {deleted} chunks."
         deleted = delete_document(user_id, document_id)
         return f"Successfully deleted document '{document_id}'. Removed {deleted} chunks."
     except Exception as e:
@@ -118,6 +150,7 @@ def server_info() -> str:
     """Return basic info about the RAG MCP server and available tools."""
     return (
         "RAG MCP server is running.\n"
+        f"Mode: {runtime_mode().value}\n"
         "Available Tools:\n"
         "- retrieve_context: Search the knowledge base\n"
         "- ingest_file: Add a document to the knowledge base\n"
@@ -154,8 +187,13 @@ if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
     
-    # Preload models so the first request doesn't timeout
-    preload_models()
+    mode = runtime_mode()
+    logging.info("Starting Agent MCP in %s mode", mode.value)
+    if mode is RuntimeMode.INTEGRATED:
+        # Preload models so the first request doesn't timeout.
+        preload_models()
+    else:
+        logging.info("Standalone mode: model preload and Qdrant are disabled")
     
     # Run the server over HTTP using streamable-http transport
     mcp.run(transport="streamable-http")
