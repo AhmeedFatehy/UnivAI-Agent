@@ -33,10 +33,21 @@ def _get_reranker():
     return _reranker
 
 
+def _by_original_score(documents: list[dict], top_k: int) -> list[dict]:
+    """Fallback ordering when the cross-encoder cannot be used."""
+    return sorted(documents, key=lambda d: d.get("score", 0), reverse=True)[:top_k]
+
+
 def rerank(query: str, documents: list[dict], top_k: int = 5) -> list[dict]:
     """Rerank documents using a cross-encoder model.
 
-    If the reranker is unavailable, returns documents sorted by original score.
+    ``TextCrossEncoder.rerank`` returns one float per document, **in the order
+    the documents were passed in** — it does not return the ranking, and it does
+    not accept a top_k. The caller owns pairing each score back to its document,
+    sorting, and trimming; that is what this function does.
+
+    If the reranker is unavailable, or returns a shape we do not recognise, the
+    documents come back sorted by their original retrieval score instead.
 
     Args:
         query: The search query.
@@ -52,27 +63,27 @@ def rerank(query: str, documents: list[dict], top_k: int = 5) -> list[dict]:
     reranker = _get_reranker()
 
     if reranker is None:
-        # Fallback: just return top_k by original score
-        return sorted(documents, key=lambda d: d.get("score", 0), reverse=True)[:top_k]
+        return _by_original_score(documents, top_k)
 
     try:
         passages = [doc["content"] for doc in documents]
-        rerank_results = list(reranker.rerank(query, passages, top_k=top_k))
+        scores = [float(score) for score in reranker.rerank(query, passages)]
 
-        # rerank_results are objects/dicts with 'score' and 'index' (or 'doc_index')
+        # A score per document is the whole contract. If that ever stops holding,
+        # fail loudly here rather than silently mapping every score onto one
+        # document — which is exactly how this went unnoticed before.
+        if len(scores) != len(documents):
+            raise ValueError(
+                f"reranker returned {len(scores)} scores for {len(documents)} documents"
+            )
+
+        ranked = sorted(enumerate(scores), key=lambda pair: pair[1], reverse=True)
+
         reranked = []
-        for result in rerank_results:
-            # Handle both dict-style and object-style results
-            if isinstance(result, dict):
-                idx = result.get("index", result.get("doc_index", 0))
-                score = result.get("score", 0)
-            else:
-                idx = getattr(result, "index", getattr(result, "doc_index", 0))
-                score = getattr(result, "score", 0)
-
-            doc = documents[idx].copy()
-            doc["rerank_score"] = score
+        for index, score in ranked[:top_k]:
+            doc = documents[index].copy()
             doc["original_score"] = doc.get("score", 0)
+            doc["rerank_score"] = score
             doc["score"] = score  # Replace with rerank score
             reranked.append(doc)
 
@@ -80,4 +91,4 @@ def rerank(query: str, documents: list[dict], top_k: int = 5) -> list[dict]:
 
     except Exception as e:
         logger.error("Reranking failed: %s. Returning original order.", e)
-        return sorted(documents, key=lambda d: d.get("score", 0), reverse=True)[:top_k]
+        return _by_original_score(documents, top_k)
