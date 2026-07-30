@@ -95,9 +95,21 @@ class FakeIndex:
             "user_id": kwargs["user_id"],
         }
 
+    def purge(self, *, user_id: str, document_id: str, collection_name: str | None) -> int:
+        before = len(self.rows)
+        self.rows = [
+            row
+            for row in self.rows
+            if not (row["user_id"] == user_id and row["document_id"] == document_id)
+        ]
+        return before - len(self.rows)
+
     def backend(self) -> IngestionBackend:
         return IngestionBackend(
-            load=markdown_loader, chunk=chunk_documents, index=self.index
+            load=markdown_loader,
+            chunk=chunk_documents,
+            index=self.index,
+            purge=self.purge,
         )
 
 

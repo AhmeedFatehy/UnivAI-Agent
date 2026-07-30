@@ -56,6 +56,19 @@ _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", re.MULTILINE)
 _SETEXT_RE = re.compile(r"^(?!\s*$)(.+)\n[=-]{3,}\s*$", re.MULTILINE)
 _FRONT_MATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
 
+# Emphasis markers to strip out of a heading before it becomes a citation.
+# PyMuPDF4LLM renders bold PDF headings as "**Day 1**", and a citation reading
+# "**Day 1** — p. 33 § **Viewing File Content**" is noise.
+# Underscores are deliberately left alone: inside a heading an underscore is far
+# more likely part of an identifier (chunk_index) than markdown emphasis.
+_EMPHASIS_RE = re.compile(r"\*+|`+|~~")
+
+
+def clean_heading(text: str) -> str:
+    """Strip markdown emphasis and stray hashes from a heading."""
+    cleaned = _EMPHASIS_RE.sub("", text or "")
+    return cleaned.strip().strip("#").strip()
+
 
 class SourceLocation(BaseModel):
     """Where a piece of evidence physically lives. This *is* the citation."""
@@ -176,10 +189,12 @@ def normalise_page(raw: object) -> int | None:
 def headings_in(text: str) -> list[str]:
     """Every Markdown heading in ``text``, in order of appearance."""
     found: list[tuple[int, str]] = [
-        (match.start(), match.group(2).strip()) for match in _HEADING_RE.finditer(text)
+        (match.start(), clean_heading(match.group(2)))
+        for match in _HEADING_RE.finditer(text)
     ]
     found.extend(
-        (match.start(), match.group(1).strip()) for match in _SETEXT_RE.finditer(text)
+        (match.start(), clean_heading(match.group(1)))
+        for match in _SETEXT_RE.finditer(text)
     )
     found.sort(key=lambda item: item[0])
     return [title for _, title in found if title]
@@ -211,10 +226,10 @@ def _leading_heading(text: str) -> str | None:
         return None
     match = _HEADING_RE.match(stripped)
     if match:
-        return match.group(2).strip() or None
+        return clean_heading(match.group(2)) or None
     setext = _SETEXT_RE.match(stripped)
     if setext:
-        return setext.group(1).strip() or None
+        return clean_heading(setext.group(1)) or None
     return None
 
 
@@ -225,8 +240,8 @@ def book_title_from(documents: list, path: Path | str) -> str:
         metadata = getattr(document, "metadata", None) or {}
         for key in ("title", "book_title", "Title"):
             candidate = metadata.get(key)
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
+            if isinstance(candidate, str) and clean_heading(candidate):
+                return clean_heading(candidate)
 
     if documents:
         head = _FRONT_MATTER_RE.sub("", getattr(documents[0], "page_content", "") or "")

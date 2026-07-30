@@ -278,6 +278,10 @@ def get_collection_stats(collection_name: str | None = None) -> dict:
         "exists": True,
         "collection_name": name,
         "points_count": info.points_count,
-        "vectors_count": info.vectors_count,
+        # CollectionInfo has no `vectors_count`; the count of vectors the index
+        # has actually built is `indexed_vectors_count`, and it is None while a
+        # freshly written collection is still indexing.
+        "indexed_vectors_count": info.indexed_vectors_count,
+        "segments_count": info.segments_count,
         "status": str(info.status),
     }

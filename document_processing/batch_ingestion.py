@@ -41,11 +41,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_ATTEMPTS = 3
 
 #: Failures that will never succeed on a retry.
+#: ImportError covers ModuleNotFoundError — a loader whose optional dependency is
+#: missing fails identically every time, so retrying it just triples the wait
+#: before the same error is reported.
 PERMANENT_ERRORS: tuple[type[BaseException], ...] = (
     FileNotFoundError,
     IsADirectoryError,
     NotADirectoryError,
     PermissionError,
+    ImportError,
     ValueError,
     TypeError,
     KeyError,
@@ -117,7 +121,7 @@ class BatchIngestionReport(BaseModel):
 
 @dataclass
 class IngestionBackend:
-    """The three side-effecting steps of ingestion, injectable for tests.
+    """The side-effecting steps of ingestion, injectable for tests.
 
     Defaults are the real pipeline: LangChain loaders, the project's chunkers
     and Qdrant indexing.
@@ -126,6 +130,7 @@ class IngestionBackend:
     load: Callable[[str], list] = field(default=None)  # type: ignore[assignment]
     chunk: Callable[[list, str], list] = field(default=None)  # type: ignore[assignment]
     index: Callable[..., dict] = field(default=None)  # type: ignore[assignment]
+    purge: Callable[..., int] = field(default=None)  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.load is None:
@@ -134,6 +139,8 @@ class IngestionBackend:
             self.chunk = chunk_documents
         if self.index is None:
             self.index = _default_index
+        if self.purge is None:
+            self.purge = _default_purge
 
     def is_retryable(self, error: BaseException) -> bool:
         return not isinstance(error, PERMANENT_ERRORS)
@@ -155,6 +162,22 @@ def _default_index(**kwargs) -> dict:
     from vector_store.indexing import index_chunks
 
     return index_chunks(**kwargs)
+
+
+def _default_purge(*, user_id: str, document_id: str, collection_name: str | None) -> int:
+    """Drop a document's existing chunks so a re-ingest replaces, not duplicates.
+
+    A collection that does not exist yet has nothing to purge, which is the
+    normal first-ingest case rather than an error.
+    """
+    from vector_store.collection_manager import delete_document
+    from vector_store.qdrant_client import get_qdrant_client
+    from config import COLLECTION_NAME
+
+    name = collection_name or COLLECTION_NAME
+    if not get_qdrant_client().collection_exists(collection_name=name):
+        return 0
+    return delete_document(user_id=user_id, document_id=document_id, collection_name=name)
 
 
 def ingest_document(
@@ -205,6 +228,18 @@ def ingest_document(
                 document_type=document_type,
                 ingested_at=ingested_at,
             )
+
+            # The document id is derived from collection + filename, so a
+            # re-ingest targets the same document. Without dropping the previous
+            # chunks first, the old and new copies both stay in the index and
+            # retrieval returns the same passage twice under two citations.
+            replaced = backend.purge(
+                user_id=user_id,
+                document_id=document_id,
+                collection_name=collection_name,
+            )
+            if replaced:
+                logger.info("Replacing %d existing chunk(s) for %s", replaced, filename)
 
             indexed = backend.index(
                 chunks=chunks,

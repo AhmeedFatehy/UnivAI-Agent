@@ -17,7 +17,9 @@ from document_processing.chunking import chunk_documents
 from document_processing.metadata import (
     ChunkMetadata,
     assign_sections,
+    book_title_from,
     citation_from_payload,
+    headings_in,
     normalise_page,
     stable_document_id,
 )
@@ -92,6 +94,45 @@ def test_document_ids_are_stable_across_reingestion(book_paths, fake_index):
     assert first.succeeded[0].document_id == stable_document_id(
         COLLECTION_ID, first.succeeded[0].path.rsplit("/", 1)[-1]
     )
+
+
+def test_reingesting_replaces_chunks_instead_of_duplicating_them(book_paths, fake_index):
+    """A stable document id is only useful if the old copy actually goes away."""
+    ingest_collection(
+        book_paths, collection_id=COLLECTION_ID, user_id=USER_ID, backend=fake_index.backend()
+    )
+    after_first = len(fake_index.rows)
+
+    ingest_collection(
+        book_paths, collection_id=COLLECTION_ID, user_id=USER_ID, backend=fake_index.backend()
+    )
+
+    assert len(fake_index.rows) == after_first, "re-ingesting must replace, not append"
+    keys = [(row["document_id"], row["chunk_index"]) for row in fake_index.rows]
+    assert len(keys) == len(set(keys)), "no chunk may appear twice"
+
+
+def test_reingestion_does_not_disturb_another_users_copy(book_paths, fake_index):
+    ingest_collection(
+        book_paths[:1], collection_id=COLLECTION_ID, user_id="student-a",
+        backend=fake_index.backend(),
+    )
+    ingest_collection(
+        book_paths[:1], collection_id=COLLECTION_ID, user_id="student-b",
+        backend=fake_index.backend(),
+    )
+    ingest_collection(
+        book_paths[:1], collection_id=COLLECTION_ID, user_id="student-a",
+        backend=fake_index.backend(),
+    )
+
+    owners = {row["user_id"] for row in fake_index.rows}
+    assert owners == {"student-a", "student-b"}
+    per_owner = {
+        owner: len([row for row in fake_index.rows if row["user_id"] == owner])
+        for owner in owners
+    }
+    assert per_owner["student-a"] == per_owner["student-b"]
 
 
 def test_the_same_book_in_two_collections_gets_two_identities(book_paths, fake_index):
@@ -186,7 +227,9 @@ class FlakyIndexer:
 
 def test_a_transient_failure_is_retried_and_succeeds(book_paths, fake_index):
     flaky = FlakyIndexer(1, fake_index.index)
-    backend = IngestionBackend(load=markdown_loader, chunk=chunk_documents, index=flaky)
+    backend = IngestionBackend(
+        load=markdown_loader, chunk=chunk_documents, index=flaky, purge=fake_index.purge
+    )
 
     result, records = ingest_document(
         book_paths[0],
@@ -203,7 +246,9 @@ def test_a_transient_failure_is_retried_and_succeeds(book_paths, fake_index):
 
 def test_retries_stop_at_max_attempts(book_paths, fake_index):
     flaky = FlakyIndexer(99, fake_index.index)
-    backend = IngestionBackend(load=markdown_loader, chunk=chunk_documents, index=flaky)
+    backend = IngestionBackend(
+        load=markdown_loader, chunk=chunk_documents, index=flaky, purge=fake_index.purge
+    )
 
     report, _ = ingest_collection(
         [book_paths[0]],
@@ -220,6 +265,35 @@ def test_retries_stop_at_max_attempts(book_paths, fake_index):
     assert report.failed[0].error_type == "ConnectionError"
 
 
+def test_a_missing_optional_dependency_is_not_retried(book_paths, fake_index):
+    """A loader whose import fails will fail identically every time."""
+
+    class LoaderMissingDependency:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, file_path):
+            self.calls += 1
+            raise ModuleNotFoundError("No module named 'markdown'")
+
+    loader = LoaderMissingDependency()
+    backend = IngestionBackend(
+        load=loader, chunk=chunk_documents, index=fake_index.index, purge=fake_index.purge
+    )
+
+    report, _ = ingest_collection(
+        [book_paths[0]],
+        collection_id=COLLECTION_ID,
+        user_id=USER_ID,
+        backend=backend,
+        max_attempts=3,
+    )
+
+    assert loader.calls == 1, "a missing module will not appear on a retry"
+    assert report.failed[0].retryable is False
+    assert report.failed[0].error_type == "ModuleNotFoundError"
+
+
 def test_a_permanent_failure_is_not_retried(book_paths, fake_index):
     class AlwaysUnsupported:
         def __init__(self):
@@ -230,7 +304,9 @@ def test_a_permanent_failure_is_not_retried(book_paths, fake_index):
             raise ValueError("Unsupported format: '.xyz'")
 
     loader = AlwaysUnsupported()
-    backend = IngestionBackend(load=loader, chunk=chunk_documents, index=fake_index.index)
+    backend = IngestionBackend(
+        load=loader, chunk=chunk_documents, index=fake_index.index, purge=fake_index.purge
+    )
 
     report, _ = ingest_collection(
         [book_paths[0]],
@@ -254,6 +330,24 @@ def test_loader_pages_are_normalised_to_one_based():
     assert normalise_page("4") == 5
     assert normalise_page(None) is None
     assert normalise_page("front matter") is None
+
+
+def test_headings_lose_their_markdown_emphasis():
+    """PyMuPDF4LLM renders bold PDF headings as '**Day 1**'; a citation must not."""
+    assert headings_in("## **Day 1 Contents**") == ["Day 1 Contents"]
+    assert headings_in("# *Intro* and `code`") == ["Intro and code"]
+    assert headings_in("### ~~Struck~~ Heading") == ["Struck Heading"]
+
+
+def test_heading_cleanup_keeps_underscores_in_identifiers():
+    """An underscore in a heading is far more often an identifier than emphasis."""
+    assert headings_in("## The chunk_index field") == ["The chunk_index field"]
+
+
+def test_a_book_title_is_cleaned_too(tmp_path):
+    book = tmp_path / "notes.md"
+    book.write_text("# **Bold Book**\n\nbody text\n", encoding="utf-8")
+    assert book_title_from(markdown_loader(str(book)), book) == "Bold Book"
 
 
 def test_a_chunk_belongs_to_the_section_it_starts_in():
