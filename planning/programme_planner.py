@@ -209,7 +209,7 @@ def create_programme_plan(
                     order=position,
                     summary=topic.summary,
                     difficulty=topic.difficulty,
-                    prerequisites=list(topic.prerequisites),
+                    prerequisites=list(graph.get(topic_id, [])),
                     contact_hours=estimate.contact_hours,
                     self_study_hours=estimate.self_study_hours,
                     total_hours=estimate.total_hours,

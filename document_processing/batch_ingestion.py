@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -164,20 +165,31 @@ def _default_index(**kwargs) -> dict:
     return index_chunks(**kwargs)
 
 
-def _default_purge(*, user_id: str, document_id: str, collection_name: str | None) -> int:
-    """Drop a document's existing chunks so a re-ingest replaces, not duplicates.
+def _default_purge(
+    *,
+    user_id: str,
+    document_id: str,
+    collection_name: str | None,
+    preserve_ingestion_id: str,
+) -> int:
+    """Drop superseded chunks only after their replacement is safely indexed.
 
     A collection that does not exist yet has nothing to purge, which is the
     normal first-ingest case rather than an error.
     """
-    from vector_store.collection_manager import delete_document
+    from vector_store.collection_manager import delete_document_versions
     from vector_store.qdrant_client import get_qdrant_client
     from config import COLLECTION_NAME
 
     name = collection_name or COLLECTION_NAME
     if not get_qdrant_client().collection_exists(collection_name=name):
         return 0
-    return delete_document(user_id=user_id, document_id=document_id, collection_name=name)
+    return delete_document_versions(
+        user_id=user_id,
+        document_id=document_id,
+        preserve_ingestion_id=preserve_ingestion_id,
+        collection_name=name,
+    )
 
 
 def ingest_document(
@@ -207,6 +219,7 @@ def ingest_document(
     last_error: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
         try:
+            ingestion_id = str(uuid.uuid4())
             documents = backend.load(str(source))
             if not documents:
                 raise ValueError(f"'{filename}' loaded as an empty document")
@@ -226,20 +239,9 @@ def ingest_document(
                 book_title=book_title,
                 source_filename=filename,
                 document_type=document_type,
+                ingestion_id=ingestion_id,
                 ingested_at=ingested_at,
             )
-
-            # The document id is derived from collection + filename, so a
-            # re-ingest targets the same document. Without dropping the previous
-            # chunks first, the old and new copies both stay in the index and
-            # retrieval returns the same passage twice under two citations.
-            replaced = backend.purge(
-                user_id=user_id,
-                document_id=document_id,
-                collection_name=collection_name,
-            )
-            if replaced:
-                logger.info("Replacing %d existing chunk(s) for %s", replaced, filename)
 
             indexed = backend.index(
                 chunks=chunks,
@@ -250,6 +252,19 @@ def ingest_document(
                 collection_name=collection_name,
             )
             chunks_indexed = int(indexed.get("chunks_indexed", len(chunks)))
+
+            # Index first, then remove every older generation. Purging before
+            # upload makes a transient embedding/Qdrant failure erase the last
+            # known-good copy. A retry also cleans up a partial earlier upload.
+            replaced = backend.purge(
+                user_id=user_id,
+                document_id=document_id,
+                collection_name=collection_name,
+                preserve_ingestion_id=ingestion_id,
+            )
+            if replaced:
+                logger.info("Replaced %d superseded chunk(s) for %s", replaced, filename)
+
             pages = len({record.page for record in records if record.page is not None})
 
             result = DocumentIngestionResult(
@@ -264,7 +279,7 @@ def ingest_document(
             )
             return result, records
 
-        except BaseException as error:  # noqa: BLE001 — wrapped and re-raised below
+        except Exception as error:  # noqa: BLE001 — wrapped and re-raised below
             last_error = error
             retryable = backend.is_retryable(error)
             if not retryable or attempt == max_attempts:

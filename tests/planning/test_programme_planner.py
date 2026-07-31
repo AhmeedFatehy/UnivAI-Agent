@@ -314,6 +314,10 @@ def test_a_cycle_is_reported_and_broken_rather_than_hanging(topics):
     assert cycles, "a circular prerequisite must be reported"
     assert set(cycles[0].topics) == {"T01", "T02"}
     assert len(order) == len(topics), "every topic is still scheduled"
+    repaired = build_graph(topics)
+    assert not (repaired["T01"] and repaired["T02"]), (
+        "one real edge must be removed; reporting a cycle is not enough"
+    )
 
 
 def test_dependency_depth_counts_the_chain(topics):
@@ -369,6 +373,23 @@ def test_packing_respects_the_semester_cap(topics):
     )
     assert len(packed) == 2, "overflow is kept, not dropped, once the cap is reached"
     assert sum(len(semester) for semester in packed) == len(topics)
+
+
+def test_related_topics_never_override_a_prerequisite_boundary(topics):
+    estimates = estimate_all(topics)
+    order, _ = teaching_order(topics)
+    graph = build_graph(topics)
+    packed = pack_semesters(
+        order,
+        estimates,
+        graph,
+        capacity_hours=1000.0,
+        keep_together=[("T01", "T02")],
+    )
+    placed = {
+        topic_id: index for index, semester in enumerate(packed) for topic_id in semester
+    }
+    assert placed["T01"] < placed["T02"]
 
 
 # ── The plan itself ───────────────────────────────────────────────────

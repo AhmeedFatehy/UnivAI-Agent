@@ -6,6 +6,8 @@ chunking, metadata and batching logic under test are the real ones.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from document_processing.batch_ingestion import (
@@ -92,7 +94,7 @@ def test_document_ids_are_stable_across_reingestion(book_paths, fake_index):
         item.document_id for item in second.succeeded
     ]
     assert first.succeeded[0].document_id == stable_document_id(
-        COLLECTION_ID, first.succeeded[0].path.rsplit("/", 1)[-1]
+        COLLECTION_ID, Path(first.succeeded[0].path).name
     )
 
 
@@ -133,6 +135,48 @@ def test_reingestion_does_not_disturb_another_users_copy(book_paths, fake_index)
         for owner in owners
     }
     assert per_owner["student-a"] == per_owner["student-b"]
+
+
+def test_failed_reingestion_keeps_the_last_good_copy(book_paths, fake_index):
+    ingest_collection(
+        book_paths[:1],
+        collection_id=COLLECTION_ID,
+        user_id=USER_ID,
+        backend=fake_index.backend(),
+    )
+    previous = list(fake_index.rows)
+
+    def fail_index(**kwargs):
+        raise ConnectionError("replacement upload failed")
+
+    backend = fake_index.backend()
+    backend.index = fail_index
+    report, _ = ingest_collection(
+        book_paths[:1],
+        collection_id=COLLECTION_ID,
+        user_id=USER_ID,
+        backend=backend,
+        max_attempts=1,
+    )
+
+    assert report.total_failure
+    assert fake_index.rows == previous
+
+
+def test_batch_does_not_swallow_process_cancellation(book_paths, fake_index):
+    def cancel(**kwargs):
+        raise KeyboardInterrupt()
+
+    backend = fake_index.backend()
+    backend.index = cancel
+
+    with pytest.raises(KeyboardInterrupt):
+        ingest_collection(
+            book_paths[:1],
+            collection_id=COLLECTION_ID,
+            user_id=USER_ID,
+            backend=backend,
+        )
 
 
 def test_the_same_book_in_two_collections_gets_two_identities(book_paths, fake_index):

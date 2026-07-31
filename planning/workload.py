@@ -133,7 +133,7 @@ def pack_semesters(
             frozenset((topic_id, other)) in pairs for other in semesters[current]
         )
 
-        if (over_capacity or prerequisite_clash) and not pinned:
+        if prerequisite_clash or (over_capacity and not pinned):
             if len(semesters) < max_semesters:
                 semesters.append([])
                 hours.append(0.0)

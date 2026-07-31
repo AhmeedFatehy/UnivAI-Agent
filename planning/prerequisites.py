@@ -28,7 +28,12 @@ class PrerequisiteIssue(BaseModel):
 
 
 def build_graph(topics: list[Topic]) -> dict[str, list[str]]:
-    """Map each topic id to the ids it depends on, keeping only known topics."""
+    """Map dependencies, dropping one deterministic back-edge per cycle."""
+    return _break_cycles(_raw_graph(topics))
+
+
+def _raw_graph(topics: list[Topic]) -> dict[str, list[str]]:
+    """Map dependencies before cycle repair, keeping only known topics."""
     known = {topic.topic_id for topic in topics}
     return {
         topic.topic_id: [
@@ -67,8 +72,42 @@ def validate_prerequisites(topics: list[Topic]) -> list[PrerequisiteIssue]:
                     )
                 )
 
-    issues.extend(_cycles(build_graph(topics), topics))
+    issues.extend(_cycles(_raw_graph(topics), topics))
     return issues
+
+
+def _break_cycles(graph: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Return an acyclic copy by removing deterministic DFS back-edges."""
+    repaired = {node: list(parents) for node, parents in graph.items()}
+    while True:
+        edge = _cycle_back_edge(repaired)
+        if edge is None:
+            return repaired
+        node, parent = edge
+        repaired[node] = [value for value in repaired[node] if value != parent]
+
+
+def _cycle_back_edge(graph: dict[str, list[str]]) -> tuple[str, str] | None:
+    colour: dict[str, int] = dict.fromkeys(graph, 0)
+
+    def visit(node: str) -> tuple[str, str] | None:
+        colour[node] = 1
+        for parent in sorted(graph.get(node, [])):
+            if colour.get(parent, 0) == 1:
+                return node, parent
+            if colour.get(parent, 0) == 0:
+                found = visit(parent)
+                if found is not None:
+                    return found
+        colour[node] = 2
+        return None
+
+    for node in sorted(graph):
+        if colour[node] == 0:
+            found = visit(node)
+            if found is not None:
+                return found
+    return None
 
 
 def _cycles(graph: dict[str, list[str]], topics: list[Topic]) -> list[PrerequisiteIssue]:

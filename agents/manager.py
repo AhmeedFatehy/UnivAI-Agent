@@ -31,7 +31,6 @@ from agents.schemas import (
     Handoff,
     Lecture,
     TaskRecord,
-    TaskState,
 )
 from planning.programme_planner import ProgrammePlan
 from tools.registry import Refusal, ToolContext
@@ -198,9 +197,13 @@ class ManagerAgent:
         trace: AgentTrace,
     ) -> GraphResult:
         refusals: list[Refusal] = list(trace.refusals)
-        completed = plan is not None and not any(
-            task.state is TaskState.FAILED for task in trace.tasks
-        )
+        selected = self.selected_topics(plan) if plan is not None else []
+        expected_ids = {topic.topic_id for topic in selected}
+        completed = plan is not None and {
+            lecture.topic_id for lecture in lectures
+        } == expected_ids and {
+            assessment.topic_id for assessment in assessments
+        } == expected_ids
         return GraphResult(
             collection_id=request.collection_id,
             user_id=request.user_id,

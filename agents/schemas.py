@@ -292,7 +292,13 @@ class GraphResult(BaseModel):
 
     @model_validator(mode="after")
     def _incomplete_runs_explain_themselves(self) -> "GraphResult":
-        if not self.completed and self.plan is None and not self.refusals:
+        failed = any(task.state is TaskState.FAILED for task in self.trace.tasks)
+        if (
+            not self.completed
+            and self.plan is None
+            and not self.refusals
+            and not failed
+        ):
             raise ValueError(
                 "a run without a plan must record why — a refusal or a failed task"
             )

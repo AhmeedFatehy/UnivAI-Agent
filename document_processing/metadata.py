@@ -120,6 +120,7 @@ class ChunkMetadata(BaseModel):
     book_title: str = Field(min_length=1)
     source_filename: str = Field(min_length=1)
     document_type: str = Field(min_length=1)
+    ingestion_id: str = Field(min_length=1)
 
     page: int | None = Field(default=None, ge=1)
     page_is_estimated: bool = False
@@ -261,6 +262,7 @@ def apply_chunk_metadata(
     book_title: str,
     source_filename: str,
     document_type: str,
+    ingestion_id: str,
     ingested_at: str | None = None,
 ) -> list[ChunkMetadata]:
     """Stamp identity onto every chunk of one book, in place.
@@ -290,6 +292,7 @@ def apply_chunk_metadata(
             book_title=book_title,
             source_filename=source_filename,
             document_type=document_type,
+            ingestion_id=ingestion_id,
             page=loader_page if loader_page is not None else index + 1,
             page_is_estimated=loader_page is None,
             section=section,

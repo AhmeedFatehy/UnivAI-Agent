@@ -265,6 +265,39 @@ def delete_document(
     return before
 
 
+def delete_document_versions(
+    user_id: str,
+    document_id: str,
+    preserve_ingestion_id: str,
+    collection_name: str | None = None,
+) -> int:
+    """Delete older generations while preserving a newly indexed replacement."""
+    name = collection_name or COLLECTION_NAME
+    client = get_qdrant_client()
+    superseded = models.Filter(
+        must=[
+            models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
+            models.FieldCondition(
+                key="document_id", match=models.MatchValue(value=document_id)
+            ),
+        ],
+        must_not=[
+            models.FieldCondition(
+                key="original_metadata.ingestion_id",
+                match=models.MatchValue(value=preserve_ingestion_id),
+            )
+        ],
+    )
+    before = client.count(collection_name=name, count_filter=superseded).count
+    if before:
+        client.delete(
+            collection_name=name,
+            points_selector=models.FilterSelector(filter=superseded),
+            wait=True,
+        )
+    return before
+
+
 def get_collection_stats(collection_name: str | None = None) -> dict:
     """Return basic stats about the collection."""
     name = collection_name or COLLECTION_NAME

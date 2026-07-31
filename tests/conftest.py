@@ -41,10 +41,9 @@ class FakeDocument:
 def markdown_loader(file_path: str) -> list[FakeDocument]:
     """Load a Markdown fixture without ``unstructured``'s NLTK downloads.
 
-    ``document_processing.loaders`` routes ``.md`` through
-    ``UnstructuredMarkdownLoader``, which wants model data at import time. The
-    fixture books are plain UTF-8, so reading them directly keeps the suite
-    offline while still feeding the real chunker real Markdown.
+    The production loader also preserves Markdown as plain UTF-8 text. This
+    small double keeps the suite offline while feeding the real chunker the
+    same Markdown content.
     """
     path = Path(file_path)
     if not path.is_file():
@@ -95,12 +94,23 @@ class FakeIndex:
             "user_id": kwargs["user_id"],
         }
 
-    def purge(self, *, user_id: str, document_id: str, collection_name: str | None) -> int:
+    def purge(
+        self,
+        *,
+        user_id: str,
+        document_id: str,
+        collection_name: str | None,
+        preserve_ingestion_id: str,
+    ) -> int:
         before = len(self.rows)
         self.rows = [
             row
             for row in self.rows
-            if not (row["user_id"] == user_id and row["document_id"] == document_id)
+            if not (
+                row["user_id"] == user_id
+                and row["document_id"] == document_id
+                and row["metadata"].get("ingestion_id") != preserve_ingestion_id
+            )
         ]
         return before - len(self.rows)
 

@@ -341,6 +341,19 @@ def test_output_that_stays_malformed_fails_the_task_without_looping(request_, re
     assert result.trace.steps <= runtime.max_steps + 1
 
 
+def test_curriculum_failure_returns_an_explained_result(request_, retriever):
+    llm = ScriptedLLM({"curriculum analyst": ["not json"] * 20})
+    runtime = AgentRuntime(
+        llm=llm, tool_context=ToolContext(retriever=retriever), max_attempts=1
+    )
+
+    result = run_programme(request_, runtime)
+
+    assert result.plan is None
+    assert result.completed is False
+    assert result.trace.by_agent(AgentName.CURRICULUM)[0].state is TaskState.FAILED
+
+
 def test_generate_structured_raises_rather_than_returning_garbage():
     llm = ScriptedLLM({"": ['{"topics": []}'] * 5})
     with pytest.raises(StructuredOutputError) as error:
@@ -504,6 +517,7 @@ def test_a_topic_with_no_retrievable_evidence_refuses_its_lecture(request_, retr
     assert refused
     assert refused[0].refusal is not None
     assert refused[0].refusal.reason
+    assert result.completed is False
 
 
 # ── The tool layer is typed on both sides ─────────────────────────────
