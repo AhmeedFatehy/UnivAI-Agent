@@ -22,6 +22,21 @@ dependencies = [
     "langgraph>=1.2.5",
     "langchain-mcp-adapters>=0.3.0",
     "langchain-ollama>=1.1.0",
+    # Schemas & prompt templates (were transitive; the agent layer depends on
+    # them directly, so they are declared)
+    "pydantic>=2.11",
+    "pyyaml>=6.0",
     # UI
     "streamlit>=1.58.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+]
+
+[tool.pytest.ini_options]
+# Tests import the repository's top-level packages (agents, planning, tools, …),
+# so the repository root has to be importable regardless of the test's directory.
+pythonpath = ["."]
+testpaths = ["tests"]

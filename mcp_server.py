@@ -13,6 +13,7 @@ from document_processing.chunking import chunk_documents
 from vector_store.indexing import index_chunks
 from vector_store.collection_manager import list_user_documents, delete_document
 from evaluation.metrics import evaluate_retrieval
+from tools.registry import TOOL_REGISTRY, TOOL_SCHEMA_VERSION, call_tool
 
 # Create the MCP server instance. The defaults preserve the integrated contract;
 # environment overrides let bounded standalone smoke tests avoid occupied ports.
@@ -146,6 +147,138 @@ def remove_document(user_id: str, document_id: str) -> str:
 
 
 @mcp.tool()
+def ingest_collection(file_paths: list[str], collection_id: str, user_id: str) -> str:
+    """Ingest several books into one collection, tolerating per-book failure.
+
+    Each book is loaded, chunked and indexed independently with its own
+    document identity, so one unreadable file does not cost the others their
+    index. Transient failures are retried; permanent ones are reported.
+
+    Args:
+        file_paths: Absolute paths of the documents to ingest.
+        collection_id: Logical collection (e.g. a programme) the books belong to.
+        user_id: The ID of the user/student who owns the collection.
+    """
+    try:
+        report = call_tool(
+            "ingest_collection",
+            {
+                "paths": file_paths,
+                "collection_id": collection_id,
+                "user_id": user_id,
+            },
+        )
+        return report.model_dump_json(indent=2)
+    except Exception as e:
+        return f"Error during collection ingestion: {str(e)}"
+
+
+@mcp.tool()
+def retrieve_grounded_context(
+    query: str,
+    user_id: str,
+    collection_id: str | None = None,
+    document_ids: list[str] | None = None,
+    limit: int = 5,
+) -> str:
+    """Retrieve passages with book/page/section citations, or refuse explicitly.
+
+    Unlike retrieve_context, this returns structured JSON: either cited passages
+    or a refusal stating that the indexed material does not cover the question.
+    Use it when the answer must be attributable.
+
+    Args:
+        query: The natural-language question.
+        user_id: The ID of the user/student making the query.
+        collection_id: Restrict to one logical multi-book collection.
+        document_ids: Restrict to specific documents.
+        limit: Maximum number of passages to return.
+    """
+    try:
+        context = call_tool(
+            "retrieve_context",
+            {
+                "query": query,
+                "user_id": user_id,
+                "collection_id": collection_id,
+                "document_ids": document_ids or [],
+                "limit": limit,
+            },
+        )
+        return context.model_dump_json(indent=2)
+    except Exception as e:
+        return f"Error during grounded retrieval: {str(e)}"
+
+
+@mcp.tool()
+def create_programme_plan(
+    programme_title: str,
+    collection_id: str,
+    user_id: str,
+    seed_queries: list[str],
+    capacity_hours: float = 120.0,
+    max_semesters: int = 8,
+) -> str:
+    """Plan a programme from an indexed collection through the agent graph.
+
+    Runs Manager → Curriculum → Content → Assessment and returns the plan, the
+    cited lectures and questions, every refusal and the task trace. Requires a
+    reachable LLM (LLM_MODEL at LLM_BASE_URL).
+
+    Args:
+        programme_title: Name of the programme to plan.
+        collection_id: The indexed collection to plan from.
+        user_id: The ID of the user/student who owns the collection.
+        seed_queries: Subject areas to retrieve evidence for.
+        capacity_hours: Hours one semester can absorb.
+        max_semesters: Upper bound on semesters.
+    """
+    try:
+        from agents.graph import run_programme
+        from agents.manager import AgentRuntime, ProgrammeRequest, ollama_llm
+
+        result = run_programme(
+            ProgrammeRequest(
+                programme_title=programme_title,
+                collection_id=collection_id,
+                user_id=user_id,
+                seed_queries=seed_queries,
+                capacity_hours=capacity_hours,
+                max_semesters=max_semesters,
+            ),
+            AgentRuntime(llm=ollama_llm()),
+        )
+        return result.model_dump_json(indent=2)
+    except Exception as e:
+        return f"Error during programme planning: {str(e)}"
+
+
+@mcp.tool()
+def get_source_location(
+    user_id: str, document_id: str, chunk_index: int | None = None
+) -> str:
+    """Resolve a citation back to its book, page, section and indexed excerpt.
+
+    Args:
+        user_id: The ID of the user/student who owns the document.
+        document_id: The document the citation points at.
+        chunk_index: The specific chunk, if the citation names one.
+    """
+    try:
+        located = call_tool(
+            "get_source_location",
+            {
+                "user_id": user_id,
+                "document_id": document_id,
+                "chunk_index": chunk_index,
+            },
+        )
+        return located.model_dump_json(indent=2)
+    except Exception as e:
+        return f"Error resolving source location: {str(e)}"
+
+
+@mcp.tool()
 def server_info() -> str:
     """Return basic info about the RAG MCP server and available tools."""
     return (
@@ -156,7 +289,13 @@ def server_info() -> str:
         "- ingest_file: Add a document to the knowledge base\n"
         "- list_documents: See all uploaded documents\n"
         "- remove_document: Delete a document\n"
-        "Supports multi-tenant isolation via user_id metadata filtering."
+        "- ingest_collection: Index several books under one collection identity\n"
+        "- retrieve_grounded_context: Cited passages, or an explicit refusal\n"
+        "- create_programme_plan: Plan a programme through the agent graph\n"
+        "- get_source_location: Resolve a citation back to book/page/section\n"
+        "Supports multi-tenant isolation via user_id metadata filtering.\n"
+        f"Typed tool contracts: {', '.join(sorted(TOOL_REGISTRY))} "
+        f"(schema v{TOOL_SCHEMA_VERSION})."
     )
 
 

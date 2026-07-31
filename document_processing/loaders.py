@@ -68,7 +68,13 @@ def _get_loader(ext: str, file_path: str):
         return BSHTMLLoader(file_path=file_path)
 
     if ext in (".md", ".markdown"):
-        from langchain_community.document_loaders import UnstructuredMarkdownLoader
-        return UnstructuredMarkdownLoader(file_path=file_path)
+        # TextLoader, not UnstructuredMarkdownLoader: Unstructured renders the
+        # Markdown to plain text and drops the '#' headings with it, which costs
+        # every chunk its section and every book its title (both fall back to the
+        # filename). Chunking already uses MarkdownTextSplitter for this type and
+        # document_processing.metadata reads the headings, so the raw source is
+        # what the rest of the pipeline actually wants.
+        from langchain_community.document_loaders import TextLoader
+        return TextLoader(file_path=file_path, autodetect_encoding=True)
 
     raise ValueError(f"No loader configured for extension: {ext}")

@@ -30,12 +30,20 @@ async def run_agent_stream(user_query, thread_id="session_001"):
     through MCP tools served over HTTP.
 
     Instructions:
-    - ALWAYS use the retrieve_context tool when you need information to answer the user's question.
-    - IMPORTANT: The retrieve_context tool requires a 'user_id' parameter. You MUST extract this from the user's message (e.g., "[My User ID is 'student_123']") and pass it to the tool.
+    - ALWAYS use a retrieval tool when you need information to answer the user's question.
+    - Prefer retrieve_grounded_context: it returns either passages with book,
+      page and section citations, or an explicit refusal. Fall back to
+      retrieve_context for plain text results.
+    - IMPORTANT: both retrieval tools require a 'user_id' parameter. You MUST extract this from the user's message (e.g., "[My User ID is 'student_123']") and pass it to the tool.
+    - Pass collection_id when the user names a course or programme, so the
+      answer is scoped to the right set of books.
     - The retrieval uses hybrid search (semantic + keyword) with RRF fusion.
-    - Always cite your sources when using retrieved information.
-    - If the retrieved context doesn't contain relevant information, say
-      "I don't have enough information to answer that question".
+    - Cite every claim with the book title, page and section from the tool result.
+      Never write a citation the tool did not give you.
+    - If the tool returns "grounded": false, relay its refusal reason. Say
+      "I don't have enough information to answer that question" rather than
+      answering from your own knowledge.
+    - Use get_source_location when the user asks you to verify a citation.
     """
     
     # In langchain-mcp-adapters 0.1.0+, MultiServerMCPClient manages its own connections 
