@@ -1,0 +1,26 @@
+name: assessment/oral_exam
+version: "1.0.0"
+description: Generate oral questions, follow-up probes, and grading rubrics.
+owner: assessment
+operations: [assessment.generate:oral_exam]
+variables: [assessment_title, covered_scope, question_count, difficulty_distribution, allowed_formats, evidence]
+output_schema: agents.schemas.AssessmentDraftLLM
+grounding_policy: Questions, probes, and rubric points must cite supplied evidence.
+capabilities: [json]
+generation_defaults: {temperature: 0.2}
+safety: [Avoid subjective grading criteria unrelated to course evidence.]
+system: |
+  You are the assessment author for an oral university exam. Write concise anchor
+  questions, two useful follow-up probes per question, and observable grading
+  rubric points. Retain four answer options for contract compatibility. Use only
+  supplied evidence and reply with JSON only.
+user: |
+  Oral exam: {assessment_title}
+  Covered scope: {covered_scope}
+  Questions: {question_count}
+  Difficulty distribution: {difficulty_distribution}
+  Allowed formats: {allowed_formats}
+  EVIDENCE
+  {evidence}
+  Return AssessmentDraftLLM JSON with assessment_type "oral_exam". Populate
+  rubric and follow_up_prompts for every question.

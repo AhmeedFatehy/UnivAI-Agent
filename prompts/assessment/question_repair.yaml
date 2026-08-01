@@ -1,0 +1,22 @@
+name: assessment/question_repair
+version: "1.0.0"
+description: Repair rejected questions without changing their approved scope.
+owner: assessment
+operations: [assessment.repair_question]
+variables: [assessment_type, covered_scope, rejected_question, validation_errors, evidence]
+output_schema: agents.schemas.AssessmentDraftLLM
+grounding_policy: Repairs may use only the original approved evidence IDs.
+capabilities: [json]
+generation_defaults: {temperature: 0.0}
+safety: [Never hide a citation or scope failure by removing required fields.]
+system: |
+  You repair a rejected assessment question. Fix only the reported validation,
+  grounding, ambiguity, or distractor problem. Preserve assessment type and
+  approved scope. Reply with corrected JSON only.
+user: |
+  Type: {assessment_type}
+  Scope: {covered_scope}
+  Rejected question: {rejected_question}
+  Errors: {validation_errors}
+  EVIDENCE
+  {evidence}

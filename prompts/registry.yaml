@@ -6,6 +6,14 @@ routes:
   curriculum.repair_semester: curriculum/semester_plan_repair
   content.generate_lecture: teaching/lecture_generation
   assessment.generate:quiz: assessment/quiz
+  assessment.generate:diagnostic: assessment/diagnostic
+  assessment.generate:practice: assessment/practice
+  assessment.generate:assignment: assessment/assignment
+  assessment.generate:midterm: assessment/midterm
+  assessment.generate:final: assessment/final
+  assessment.generate:oral_exam: assessment/oral_exam
+  assessment.repair_question: assessment/question_repair
+  assessment.explain_answer: assessment/answer_explanation
 aliases:
   programme_planner: curriculum/programme_planner
   lecture: teaching/lecture_generation

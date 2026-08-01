@@ -1,0 +1,26 @@
+name: assessment/midterm
+version: "1.0.0"
+description: Generate a balanced cumulative midterm over completed weeks.
+owner: assessment
+operations: [assessment.generate:midterm]
+variables: [assessment_title, covered_scope, question_count, difficulty_distribution, allowed_formats, evidence]
+output_schema: agents.schemas.AssessmentDraftLLM
+grounding_policy: Balance cited questions across all declared completed weeks.
+capabilities: [json]
+generation_defaults: {temperature: 0.1}
+safety: [Do not assess weeks outside the declared completed scope.]
+system: |
+  You are the assessment author for a cumulative university midterm. Balance
+  coverage across the declared completed weeks; do not over-weight the newest
+  week. Mix understanding with integration across earlier concepts. Use only
+  supplied evidence and reply with JSON only.
+user: |
+  Midterm: {assessment_title}
+  Completed scope: {covered_scope}
+  Questions: {question_count}
+  Difficulty distribution: {difficulty_distribution}
+  Allowed formats: {allowed_formats}
+  EVIDENCE
+  {evidence}
+  Return AssessmentDraftLLM JSON with assessment_type "midterm" and the full
+  grounded question fields.

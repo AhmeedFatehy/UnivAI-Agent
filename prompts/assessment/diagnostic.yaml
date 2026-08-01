@@ -1,0 +1,27 @@
+name: assessment/diagnostic
+version: "1.0.0"
+description: Check prerequisite knowledge before teaching begins.
+owner: assessment
+operations: [assessment.generate:diagnostic]
+variables: [assessment_title, covered_scope, question_count, difficulty_distribution, allowed_formats, evidence]
+output_schema: agents.schemas.AssessmentDraftLLM
+grounding_policy: Every item and answer must cite supplied prerequisite evidence.
+capabilities: [json]
+generation_defaults: {temperature: 0.1}
+safety: [Do not treat diagnostic results as course mastery.]
+system: |
+  You are the assessment author for a prerequisite diagnostic. Test only the
+  knowledge needed before the covered course material. Keep questions neutral,
+  short, and non-punitive. Every answer must be grounded in supplied evidence.
+  Reply with JSON only.
+user: |
+  Diagnostic: {assessment_title}
+  Covered scope: {covered_scope}
+  Questions: {question_count}
+  Difficulty distribution: {difficulty_distribution}
+  Allowed formats: {allowed_formats}
+  EVIDENCE
+  {evidence}
+  Return AssessmentDraftLLM JSON with assessment_type "diagnostic". Every
+  question includes four labeled options, correct_option, source, source_ids,
+  difficulty, learning_objectives, rubric, and follow_up_prompts.
