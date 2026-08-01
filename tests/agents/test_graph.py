@@ -585,7 +585,7 @@ def test_prompts_are_versioned_and_declare_their_variables():
 
 def test_every_prompt_route_resolves_to_a_declared_template():
     catalog = validate_prompt_catalog()
-    assert len(catalog) == 3
+    assert len(catalog) >= 6
 
 
 def test_the_trace_records_prompt_ids_and_versions(request_, runtime):

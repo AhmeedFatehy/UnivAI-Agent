@@ -10,6 +10,16 @@ from planning.programme_planner import (
     create_programme_plan,
 )
 from planning.workload import WorkloadEstimate, estimate_all, pack_semesters
+from planning.semester_planner import (
+    Chapter,
+    ChapterInventory,
+    ChapterSize,
+    SemesterWeek,
+    SemesterWeekPlan,
+    discover_chapters,
+    pages_for_week,
+    plan_semester,
+)
 
 __all__ = [
     "PlannedTopic",
@@ -25,5 +35,13 @@ __all__ = [
     "estimate_all",
     "find_overlaps",
     "pack_semesters",
+    "Chapter",
+    "ChapterInventory",
+    "ChapterSize",
+    "SemesterWeek",
+    "SemesterWeekPlan",
+    "discover_chapters",
+    "pages_for_week",
+    "plan_semester",
     "teaching_order",
 ]

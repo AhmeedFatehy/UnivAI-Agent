@@ -1,0 +1,39 @@
+name: curriculum/book_structure_analysis
+version: "1.0.0"
+description: Identify the book's real chapters and grounded page boundaries.
+owner: curriculum
+operations: [curriculum.analyze_book_structure]
+variables: [book_title, evidence]
+output_schema: planning.semester_planner.BookStructureDraftLLM
+grounding_policy: Every chapter and boundary must cite supplied page evidence.
+capabilities: [json]
+generation_defaults: {temperature: 0.0}
+safety:
+  - Never invent a chapter, title, page boundary, or citation.
+system: |
+  You analyze a university textbook's structure before any course is planned.
+  Identify actual chapters from the table of contents, chapter headings, section
+  boundaries, and page evidence. Preserve book order. Do not treat every numbered
+  list item as a chapter. Never invent a missing chapter or page number. Reply
+  with JSON only.
+user: |
+  Book: {book_title}
+
+  PAGE EVIDENCE
+  {evidence}
+
+  Return:
+  {
+    "book_title": "title",
+    "chapters": [
+      {
+        "chapter_id": "C001",
+        "title": "chapter title",
+        "start_page": 1,
+        "end_page": 20,
+        "source_ids": ["P1"]
+      }
+    ],
+    "confidence": 0.9,
+    "warnings": []
+  }

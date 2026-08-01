@@ -1,0 +1,25 @@
+name: curriculum/semester_plan_repair
+version: "1.0.0"
+description: Repair a rejected semester proposal without changing its source inventory.
+owner: curriculum
+operations: [curriculum.repair_semester]
+variables: [chapter_inventory, rejected_plan, validation_errors]
+output_schema: planning.semester_planner.SemesterPlanDraftLLM
+grounding_policy: Use only chapter IDs from the unchanged approved inventory.
+capabilities: [json]
+generation_defaults: {temperature: 0.0}
+safety:
+  - Fix only the reported rule violations and never remove content.
+system: |
+  Repair a rejected semester plan. Keep every approved chapter, preserve order,
+  use at most three adjacent chapters per week, and at most two weeks for a split
+  chapter. Reply with corrected JSON only.
+user: |
+  INVENTORY
+  {chapter_inventory}
+
+  REJECTED PLAN
+  {rejected_plan}
+
+  VALIDATION ERRORS
+  {validation_errors}
