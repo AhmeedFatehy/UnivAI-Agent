@@ -195,6 +195,30 @@ def validate_prompt_catalog(
 ) -> dict[PromptId, PromptTemplate]:
     """Load every routed prompt and reject missing or duplicate declarations."""
     registry = load_prompt_registry(prompts_dir)
+    directory = _directory(prompts_dir)
+    missing_operations = set(PromptOperation) - set(registry.routes)
+    if missing_operations:
+        raise ValueError(
+            "prompt operations without routes: "
+            f"{sorted(operation.value for operation in missing_operations)}"
+        )
+    unrouted_prompts = set(PromptId) - set(registry.routes.values())
+    if unrouted_prompts:
+        raise ValueError(
+            "prompt IDs without routes: "
+            f"{sorted(prompt_id.value for prompt_id in unrouted_prompts)}"
+        )
+    files = {
+        path.relative_to(directory).with_suffix("").as_posix()
+        for path in directory.rglob("*.yaml")
+        if path.name != "registry.yaml"
+    }
+    expected_files = {prompt_id.value for prompt_id in PromptId}
+    if files != expected_files:
+        raise ValueError(
+            "prompt files do not match declared prompt IDs; "
+            f"missing={sorted(expected_files - files)}, extra={sorted(files - expected_files)}"
+        )
     loaded: dict[PromptId, PromptTemplate] = {}
     operation_owners: dict[PromptOperation, PromptId] = {}
     for operation, prompt_id in registry.routes.items():

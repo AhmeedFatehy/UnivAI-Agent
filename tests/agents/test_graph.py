@@ -12,7 +12,12 @@ import json
 
 import pytest
 
-from agents.prompts import PromptOperation, load_prompt_for, validate_prompt_catalog
+from agents.prompts import (
+    PromptId,
+    PromptOperation,
+    load_prompt_for,
+    validate_prompt_catalog,
+)
 from agents.graph import (
     PROGRAMME_STAGE,
     build_graph,
@@ -586,7 +591,7 @@ def test_prompts_are_versioned_and_declare_their_variables():
 
 def test_every_prompt_route_resolves_to_a_declared_template():
     catalog = validate_prompt_catalog()
-    assert len(catalog) >= 6
+    assert set(catalog) == set(PromptId)
 
 
 def test_the_trace_records_prompt_ids_and_versions(request_, runtime):
