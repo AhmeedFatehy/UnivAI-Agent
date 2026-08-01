@@ -27,6 +27,7 @@ from agents.schemas import (
     AgentName,
     AgentTrace,
     Assessment,
+    AssessmentType,
     GraphResult,
     Handoff,
     Lecture,
@@ -73,6 +74,10 @@ class ProgrammeRequest:
     max_topics: int = 8
     slide_count: int = 4
     question_count: int = 4
+    assessment_type: AssessmentType = AssessmentType.QUIZ
+    assessment_scope: list[str] = field(default_factory=list)
+    difficulty_distribution: str = "mostly easy and medium"
+    allowed_question_formats: list[str] = field(default_factory=lambda: ["mcq"])
     #: Restrict lecture/assessment retrieval to the books the topic's own
     #: evidence came from. Off by default: a topic is usually covered by more
     #: than one book, and narrowing to the first book that happened to match
@@ -165,7 +170,13 @@ class ManagerAgent:
             objective=f"Write assessment questions for '{topic.title}'",
             request=request,
             payload=self._topic_payload(request, topic),
-            constraints={"question_count": request.question_count},
+            constraints={
+                "question_count": request.question_count,
+                "assessment_type": request.assessment_type.value,
+                "covered_scope": request.assessment_scope or [topic.title],
+                "difficulty_distribution": request.difficulty_distribution,
+                "allowed_formats": request.allowed_question_formats,
+            },
         )
 
     # ── Task bookkeeping ──────────────────────────────────────────────

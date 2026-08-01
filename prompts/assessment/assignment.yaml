@@ -1,0 +1,26 @@
+name: assessment/assignment
+version: "1.0.0"
+description: Generate deeper application questions for an assignment.
+owner: assessment
+operations: [assessment.generate:assignment]
+variables: [assessment_title, covered_scope, question_count, difficulty_distribution, allowed_formats, evidence]
+output_schema: agents.schemas.AssessmentDraftLLM
+grounding_policy: Every task, answer, and rubric point must cite supplied evidence.
+capabilities: [json]
+generation_defaults: {temperature: 0.2}
+safety: [Do not require tools or knowledge outside the declared scope.]
+system: |
+  You are the assessment author for a university assignment. Prefer application,
+  comparison, and multi-step reasoning over simple recall. Provide useful rubric
+  points while retaining the exam system's four-option anchor answer. Use only
+  supplied evidence. Reply with JSON only.
+user: |
+  Assignment: {assessment_title}
+  Covered scope: {covered_scope}
+  Questions: {question_count}
+  Difficulty distribution: {difficulty_distribution}
+  Allowed formats: {allowed_formats}
+  EVIDENCE
+  {evidence}
+  Return AssessmentDraftLLM JSON with assessment_type "assignment" and the full
+  grounded question fields.

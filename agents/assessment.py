@@ -16,6 +16,7 @@ from agents.schemas import (
     Assessment,
     AssessmentDraftLLM,
     AssessmentQuestion,
+    AssessmentType,
     Handoff,
     StructuredOutputError,
     TaskRecord,
@@ -30,6 +31,16 @@ from tools.registry import GroundedContext, RetrieveContextInput, call_tool
 
 DEFAULT_QUESTION_COUNT = 4
 DEFAULT_EVIDENCE_LIMIT = 6
+
+ASSESSMENT_OPERATIONS = {
+    AssessmentType.DIAGNOSTIC: PromptOperation.ASSESSMENT_DIAGNOSTIC,
+    AssessmentType.PRACTICE: PromptOperation.ASSESSMENT_PRACTICE,
+    AssessmentType.QUIZ: PromptOperation.ASSESSMENT_QUIZ,
+    AssessmentType.ASSIGNMENT: PromptOperation.ASSESSMENT_ASSIGNMENT,
+    AssessmentType.MIDTERM: PromptOperation.ASSESSMENT_MIDTERM,
+    AssessmentType.FINAL: PromptOperation.ASSESSMENT_FINAL,
+    AssessmentType.ORAL_EXAM: PromptOperation.ASSESSMENT_ORAL,
+}
 
 
 class AssessmentAgent:
@@ -48,6 +59,14 @@ class AssessmentAgent:
         question_count = int(
             handoff.constraints.get("question_count", DEFAULT_QUESTION_COUNT)
         )
+        assessment_type = AssessmentType(
+            handoff.constraints.get("assessment_type", AssessmentType.QUIZ.value)
+        )
+        covered_scope = list(handoff.constraints.get("covered_scope") or [topic_title])
+        difficulty_distribution = str(
+            handoff.constraints.get("difficulty_distribution", "mostly easy and medium")
+        )
+        allowed_formats = list(handoff.constraints.get("allowed_formats") or ["mcq"])
         evidence_limit = int(
             handoff.constraints.get("evidence_limit", DEFAULT_EVIDENCE_LIMIT)
         )
@@ -55,7 +74,10 @@ class AssessmentAgent:
         context = call_tool(
             "retrieve_context",
             RetrieveContextInput(
-                query=f"{topic_title}. {handoff.payload.get('topic_summary', '')}".strip(),
+                query=(
+                    f"{topic_title}. {handoff.payload.get('topic_summary', '')}. "
+                    f"Assessment scope: {'; '.join(covered_scope)}"
+                ).strip(),
                 user_id=handoff.user_id,
                 collection_id=handoff.collection_id,
                 document_ids=handoff.payload.get("document_ids") or [],
@@ -79,17 +101,21 @@ class AssessmentAgent:
             task.refuse(context.refusal)
             return None
 
-        template = load_prompt_for(PromptOperation.ASSESSMENT_QUIZ)
+        operation = ASSESSMENT_OPERATIONS[assessment_type]
+        template = load_prompt_for(operation)
         task.prompts.append(
             PromptUseRecord(
-                operation=PromptOperation.ASSESSMENT_QUIZ.value,
+                operation=operation.value,
                 prompt_id=template.name.value,
                 version=template.version,
             )
         )
         prompt = template.render(
-            topic_title=topic_title,
+            assessment_title=topic_title,
+            covered_scope="; ".join(covered_scope),
             question_count=question_count,
+            difficulty_distribution=difficulty_distribution,
+            allowed_formats=", ".join(allowed_formats),
             evidence=context.as_prompt_block(),
         )
 
@@ -101,6 +127,11 @@ class AssessmentAgent:
                 repair_attempts=self.runtime.repair_attempts,
                 on_call=lambda: setattr(task, "llm_calls", task.llm_calls + 1),
             )
+            if draft.assessment_type is not assessment_type:
+                raise ValueError(
+                    f"prompt returned assessment_type={draft.assessment_type.value}; "
+                    f"expected {assessment_type.value}"
+                )
             questions = [
                 AssessmentQuestion(
                     prompt=question.prompt,
@@ -108,11 +139,19 @@ class AssessmentAgent:
                     correct_option=question.correct_option,
                     source=question.source,
                     citations=resolve_citations(question.source_ids, context),
+                    difficulty=question.difficulty,
+                    learning_objectives=question.learning_objectives,
+                    rubric=question.rubric,
+                    follow_up_prompts=question.follow_up_prompts,
                 )
                 for question in draft.questions
             ]
             assessment = Assessment(
-                topic_id=topic_id, title=topic_title, questions=questions
+                topic_id=topic_id,
+                title=topic_title,
+                assessment_type=assessment_type,
+                covered_scope=covered_scope,
+                questions=questions,
             )
         except (StructuredOutputError, UngroundedCitation, ValueError) as error:
             task.fail(f"assessment draft rejected: {error}")
@@ -122,4 +161,9 @@ class AssessmentAgent:
         return assessment
 
 
-__all__ = ["DEFAULT_EVIDENCE_LIMIT", "DEFAULT_QUESTION_COUNT", "AssessmentAgent"]
+__all__ = [
+    "ASSESSMENT_OPERATIONS",
+    "DEFAULT_EVIDENCE_LIMIT",
+    "DEFAULT_QUESTION_COUNT",
+    "AssessmentAgent",
+]

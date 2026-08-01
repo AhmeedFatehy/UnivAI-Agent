@@ -1,0 +1,26 @@
+name: assessment/final
+version: "1.0.0"
+description: Generate a comprehensive final over the approved semester plan.
+owner: assessment
+operations: [assessment.generate:final]
+variables: [assessment_title, covered_scope, question_count, difficulty_distribution, allowed_formats, evidence]
+output_schema: agents.schemas.AssessmentDraftLLM
+grounding_policy: Cover the full declared semester with citations and balanced weighting.
+capabilities: [json]
+generation_defaults: {temperature: 0.1}
+safety: [Do not invent uncovered material or over-weight the final weeks.]
+system: |
+  You are the assessment author for a cumulative university final. Cover the
+  full approved semester, balance early and late weeks, and include integrative
+  questions connecting concepts across chapters. Use only supplied evidence.
+  Reply with JSON only.
+user: |
+  Final: {assessment_title}
+  Full semester scope: {covered_scope}
+  Questions: {question_count}
+  Difficulty distribution: {difficulty_distribution}
+  Allowed formats: {allowed_formats}
+  EVIDENCE
+  {evidence}
+  Return AssessmentDraftLLM JSON with assessment_type "final" and the full
+  grounded question fields.

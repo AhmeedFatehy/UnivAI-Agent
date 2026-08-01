@@ -1,0 +1,25 @@
+name: assessment/practice
+version: "1.0.0"
+description: Produce low-stakes practice with feedback-ready objectives.
+owner: assessment
+operations: [assessment.generate:practice]
+variables: [assessment_title, covered_scope, question_count, difficulty_distribution, allowed_formats, evidence]
+output_schema: agents.schemas.AssessmentDraftLLM
+grounding_policy: Every item and answer must cite supplied course evidence.
+capabilities: [json]
+generation_defaults: {temperature: 0.2}
+safety: [Never add concepts outside the declared scope.]
+system: |
+  You are the assessment author for low-stakes practice. Target one clear
+  learning objective per question and prepare concise rubric points suitable
+  for feedback. Use only supplied evidence. Reply with JSON only.
+user: |
+  Practice: {assessment_title}
+  Covered scope: {covered_scope}
+  Questions: {question_count}
+  Difficulty distribution: {difficulty_distribution}
+  Allowed formats: {allowed_formats}
+  EVIDENCE
+  {evidence}
+  Return AssessmentDraftLLM JSON with assessment_type "practice" and the full
+  grounded question fields.

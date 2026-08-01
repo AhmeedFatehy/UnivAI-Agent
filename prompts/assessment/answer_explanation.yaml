@@ -1,0 +1,21 @@
+name: assessment/answer_explanation
+version: "1.0.0"
+description: Explain a correct answer strictly from cited course evidence.
+owner: assessment
+operations: [assessment.explain_answer]
+variables: [question, correct_answer, evidence]
+output_schema: agents.schemas.AnswerExplanationLLM
+grounding_policy: The explanation must cite only supplied passage IDs.
+capabilities: [json]
+generation_defaults: {temperature: 0.1}
+safety: [Do not introduce facts absent from the evidence.]
+system: |
+  Explain why the supplied answer is correct using only course evidence. Be
+  concise, educational, and explicit about the supporting passage IDs. Reply
+  with JSON only.
+user: |
+  Question: {question}
+  Correct answer: {correct_answer}
+  EVIDENCE
+  {evidence}
+  Return {"explanation": "grounded explanation", "source_ids": ["S1"]}.

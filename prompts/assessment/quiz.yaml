@@ -3,7 +3,7 @@ version: "1.1.0"
 description: Write a short grounded quiz for one week or topic.
 owner: assessment
 operations: [assessment.generate:quiz]
-variables: [topic_title, question_count, evidence]
+variables: [assessment_title, covered_scope, question_count, difficulty_distribution, allowed_formats, evidence]
 output_schema: agents.schemas.AssessmentDraftLLM
 grounding_policy: Every correct answer must cite only supplied passage IDs.
 capabilities: [json]
@@ -22,21 +22,29 @@ system: |
   - Do not test page numbers, formatting, or wording trivia.
   - Reply with JSON only. No prose or markdown fences.
 user: |
-  Topic: {topic_title}
+  Quiz: {assessment_title}
+  Covered scope: {covered_scope}
   Write {question_count} quiz questions.
+  Difficulty distribution: {difficulty_distribution}
+  Allowed formats: {allowed_formats}
 
   EVIDENCE
   {evidence}
 
   Reply with this exact JSON shape:
   {
+    "assessment_type": "quiz",
     "questions": [
       {
         "prompt": "question text",
         "options": ["A) first", "B) second", "C) third", "D) fourth"],
         "correct_option": "A",
         "source": "lecture",
-        "source_ids": ["S1"]
+        "source_ids": ["S1"],
+        "difficulty": 2,
+        "learning_objectives": ["objective"],
+        "rubric": [],
+        "follow_up_prompts": []
       }
     ]
   }

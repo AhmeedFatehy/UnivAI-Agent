@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from agents.prompts import validate_prompt_catalog
+from agents.prompts import PromptOperation, load_prompt_for, validate_prompt_catalog
 from agents.graph import (
     PROGRAMME_STAGE,
     build_graph,
@@ -25,6 +25,7 @@ from agents.manager import AgentRuntime, ManagerAgent, ProgrammeRequest
 from agents.schemas import (
     AgentName,
     AgentTrace,
+    AssessmentType,
     GraphResult,
     Handoff,
     LectureDraftLLM,
@@ -593,6 +594,24 @@ def test_the_trace_records_prompt_ids_and_versions(request_, runtime):
     uses = [prompt for task in result.trace.tasks for prompt in task.prompts]
     assert uses
     assert all(prompt.prompt_id and prompt.version for prompt in uses)
+
+
+@pytest.mark.parametrize(
+    ("assessment_type", "operation", "prompt_id"),
+    [
+        (AssessmentType.DIAGNOSTIC, PromptOperation.ASSESSMENT_DIAGNOSTIC, "assessment/diagnostic"),
+        (AssessmentType.PRACTICE, PromptOperation.ASSESSMENT_PRACTICE, "assessment/practice"),
+        (AssessmentType.QUIZ, PromptOperation.ASSESSMENT_QUIZ, "assessment/quiz"),
+        (AssessmentType.ASSIGNMENT, PromptOperation.ASSESSMENT_ASSIGNMENT, "assessment/assignment"),
+        (AssessmentType.MIDTERM, PromptOperation.ASSESSMENT_MIDTERM, "assessment/midterm"),
+        (AssessmentType.FINAL, PromptOperation.ASSESSMENT_FINAL, "assessment/final"),
+        (AssessmentType.ORAL_EXAM, PromptOperation.ASSESSMENT_ORAL, "assessment/oral_exam"),
+    ],
+)
+def test_each_assessment_type_has_its_own_prompt(assessment_type, operation, prompt_id):
+    template = load_prompt_for(operation)
+    assert template.name.value == prompt_id
+    assert assessment_type.value in template.name.value
 
 
 def test_a_prompt_refuses_to_render_with_a_missing_variable():

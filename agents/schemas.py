@@ -61,6 +61,16 @@ class AgentName(str, Enum):
     ASSESSMENT = "assessment"
 
 
+class AssessmentType(str, Enum):
+    DIAGNOSTIC = "diagnostic"
+    PRACTICE = "practice"
+    QUIZ = "quiz"
+    ASSIGNMENT = "assignment"
+    MIDTERM = "midterm"
+    FINAL = "final"
+    ORAL_EXAM = "oral_exam"
+
+
 class ToolCallRecord(BaseModel):
     """One tool invocation, as it happened."""
 
@@ -232,6 +242,10 @@ class DraftQuestion(BaseModel):
     correct_option: Literal["A", "B", "C", "D"]
     source: Literal["lecture", "self_study"] = "lecture"
     source_ids: list[str] = Field(min_length=1)
+    difficulty: int = Field(default=2, ge=1, le=5)
+    learning_objectives: list[str] = Field(default_factory=list)
+    rubric: list[str] = Field(default_factory=list)
+    follow_up_prompts: list[str] = Field(default_factory=list)
 
     @field_validator("source_ids")
     @classmethod
@@ -240,7 +254,18 @@ class DraftQuestion(BaseModel):
 
 
 class AssessmentDraftLLM(BaseModel):
+    assessment_type: AssessmentType = AssessmentType.QUIZ
     questions: list[DraftQuestion] = Field(min_length=1)
+
+
+class AnswerExplanationLLM(BaseModel):
+    explanation: str = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)
+
+    @field_validator("source_ids")
+    @classmethod
+    def _passage_ids(cls, values: list[str]) -> list[str]:
+        return clean_passage_ids(values)
 
 
 # ── Grounded results the graph returns ────────────────────────────────
@@ -271,11 +296,17 @@ class AssessmentQuestion(BaseModel):
     correct_option: Literal["A", "B", "C", "D"]
     source: Literal["lecture", "self_study"]
     citations: list[SourceLocation] = Field(min_length=1)
+    difficulty: int = Field(default=2, ge=1, le=5)
+    learning_objectives: list[str] = Field(default_factory=list)
+    rubric: list[str] = Field(default_factory=list)
+    follow_up_prompts: list[str] = Field(default_factory=list)
 
 
 class Assessment(BaseModel):
     topic_id: str
     title: str
+    assessment_type: AssessmentType = AssessmentType.QUIZ
+    covered_scope: list[str] = Field(default_factory=list)
     questions: list[AssessmentQuestion] = Field(min_length=1)
 
 
@@ -528,6 +559,8 @@ __all__ = [
     "Assessment",
     "AssessmentDraftLLM",
     "AssessmentQuestion",
+    "AssessmentType",
+    "AnswerExplanationLLM",
     "DraftQuestion",
     "DraftSegment",
     "ExtractedTopic",
