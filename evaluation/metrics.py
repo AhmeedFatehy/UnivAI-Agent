@@ -6,6 +6,7 @@ import logging
 import json
 
 from config import LLM_MODEL
+from agents.prompts import PromptOperation, load_prompt_for
 from retrieval.query_transform import _get_llm  # reuse the LLM singleton
 
 logger = logging.getLogger(__name__)
@@ -23,16 +24,9 @@ def evaluate_retrieval(query: str, retrieved_docs: list[dict]) -> dict:
         f"[Doc {i+1}] {doc['content']}" for i, doc in enumerate(docs_to_eval)
     )
 
-    prompt = f"""You are a RAG evaluator. Your task is to evaluate if the retrieved context is relevant to the query.
-Score the context precision from 0.0 to 1.0 (where 1.0 means highly relevant context that fully answers the query, and 0.0 means completely irrelevant).
-
-Query: {query}
-Context:
-{context}
-
-Return ONLY a JSON object with two keys: "score" (float) and "reasoning" (brief string).
-Example: {{"score": 0.8, "reasoning": "Doc 1 and 2 directly address the query, but Doc 3 is irrelevant."}}
-"""
+    prompt = load_prompt_for(PromptOperation.EVALUATION_RETRIEVAL).render(
+        query=query, context=context
+    )
 
     try:
         response = llm.invoke(prompt)
@@ -53,18 +47,9 @@ def evaluate_generation(query: str, answer: str, context: str) -> dict:
     if llm is None or not answer or not context:
         return {"faithfulness": 0.0, "answer_relevancy": 0.0}
 
-    prompt = f"""You are a RAG evaluator. Evaluate the generated answer based on the query and context.
-Score two metrics from 0.0 to 1.0:
-1. Faithfulness: Is the answer fully supported by the context? (1.0 = fully supported, no hallucinations)
-2. Answer Relevancy: Does the answer directly address the user's query? (1.0 = direct and complete)
-
-Query: {query}
-Context: {context}
-Answer: {answer}
-
-Return ONLY a JSON object with keys: "faithfulness", "answer_relevancy", and "reasoning".
-Example: {{"faithfulness": 0.9, "answer_relevancy": 1.0, "reasoning": "Answer is relevant and grounded, minor extra detail not in context."}}
-"""
+    prompt = load_prompt_for(PromptOperation.EVALUATION_GROUNDEDNESS).render(
+        query=query, context=context, answer=answer
+    )
 
     try:
         response = llm.invoke(prompt)

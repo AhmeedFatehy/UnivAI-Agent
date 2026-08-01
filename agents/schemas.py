@@ -24,7 +24,7 @@ from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from agents.prompts import PromptTemplate, load_prompt
+from agents.prompts import PromptOperation, PromptTemplate, load_prompt, load_prompt_for
 from document_processing.metadata import SourceLocation
 from planning.overlap import Topic
 from planning.programme_planner import ProgrammePlan
@@ -456,14 +456,11 @@ def _compact_validation_error(error: ValidationError) -> str:
 def _repair_prompt(
     original: str, bad_output: str, error: str, schema: type[BaseModel]
 ) -> str:
-    return (
-        f"{original}\n\n"
-        "--- REPAIR ---\n"
-        "Your previous reply was rejected by schema validation.\n"
-        f"Previous reply:\n{bad_output[:2000]}\n\n"
-        f"Validation errors: {error}\n\n"
-        f"Required JSON schema:\n{json.dumps(schema.model_json_schema(), indent=2)[:3000]}\n\n"
-        "Reply with corrected JSON only. No prose, no code fences."
+    return load_prompt_for(PromptOperation.SHARED_REPAIR_JSON).render(
+        original_prompt=original,
+        previous_reply=bad_output[:2000],
+        validation_errors=error,
+        json_schema=json.dumps(schema.model_json_schema(), indent=2)[:3000],
     )
 
 

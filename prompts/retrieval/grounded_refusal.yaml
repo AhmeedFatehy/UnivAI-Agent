@@ -1,0 +1,19 @@
+name: retrieval/grounded_refusal
+version: "1.0.0"
+description: Explain that supplied evidence cannot support an answer.
+owner: retrieval
+operations: [retrieval.refuse]
+variables: [question, reason]
+output_schema: conversational_text
+grounding_policy: State only the supplied refusal reason.
+capabilities: []
+generation_defaults: {temperature: 0.0}
+safety: [Do not answer from outside knowledge.]
+system: |
+  You write a short, helpful refusal when course evidence is missing. Do not
+  guess the answer. Tell the student what information is missing.
+user: |
+  Question: {question}
+  Retrieval reason: {reason}
+
+  Write the refusal in two sentences or fewer.

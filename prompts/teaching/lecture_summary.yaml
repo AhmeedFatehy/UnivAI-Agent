@@ -1,0 +1,19 @@
+name: teaching/lecture_summary
+version: "1.0.0"
+description: Summarize one grounded lecture without losing its key ideas.
+owner: content
+operations: [content.summarize_lecture]
+variables: [lecture, target_length]
+output_schema: plain_text
+grounding_policy: Use only facts and citations already present in the lecture.
+capabilities: [citations]
+generation_defaults: {temperature: 0.1}
+safety: [Do not add outside facts or new citations.]
+system: |
+  You summarize university lectures. Preserve core definitions, relationships,
+  warnings, and existing citations. Do not introduce new information.
+user: |
+  Target length: {target_length}
+
+  Lecture:
+  {lecture}

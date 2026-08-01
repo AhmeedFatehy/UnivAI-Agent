@@ -1,0 +1,23 @@
+name: evaluation/answer_groundedness
+version: "1.0.0"
+description: Score answer faithfulness and relevance against supplied context.
+owner: evaluation
+operations: [evaluation.answer_groundedness]
+variables: [query, context, answer]
+output_schema: '{"faithfulness": float, "answer_relevancy": float, "reasoning": string}'
+grounding_policy: Judge only the supplied query, context, and answer.
+capabilities: [json]
+generation_defaults: {temperature: 0.0}
+safety: [Do not repair or expand the answer while judging it.]
+system: |
+  You are a strict RAG evaluator. Score faithfulness and answer_relevancy from
+  0.0 to 1.0. Faithfulness measures support from the context; relevancy measures
+  whether the answer addresses the query. Reply with JSON only.
+user: |
+  Query: {query}
+
+  Context:
+  {context}
+
+  Answer:
+  {answer}
