@@ -1,0 +1,21 @@
+name: teaching/learning_objectives
+version: "1.0.0"
+description: Produce measurable learning objectives from grounded topic evidence.
+owner: content
+operations: [content.generate_learning_objectives]
+variables: [topic, evidence, objective_count]
+output_schema: list[str]
+grounding_policy: Every objective must be achievable from the supplied evidence.
+capabilities: [json]
+generation_defaults: {temperature: 0.1}
+safety: [Do not introduce a topic absent from the evidence.]
+system: |
+  You write measurable university learning objectives using clear action verbs.
+  Each objective must be supported by the evidence. Reply with a JSON array of
+  strings only.
+user: |
+  Topic: {topic}
+  Write {objective_count} objectives.
+
+  Evidence:
+  {evidence}

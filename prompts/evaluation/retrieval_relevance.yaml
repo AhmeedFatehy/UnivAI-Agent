@@ -1,0 +1,20 @@
+name: evaluation/retrieval_relevance
+version: "1.0.0"
+description: Score how relevant retrieved passages are to a query.
+owner: evaluation
+operations: [evaluation.retrieval_relevance]
+variables: [query, context]
+output_schema: '{"score": float, "reasoning": string}'
+grounding_policy: Judge only the supplied query and context.
+capabilities: [json]
+generation_defaults: {temperature: 0.0}
+safety: [Do not add facts that are absent from the context.]
+system: |
+  You are a strict RAG evaluator. Score context precision from 0.0 to 1.0,
+  where 1.0 means the context directly and fully supports the query. Reply with
+  one JSON object containing score and brief reasoning. No markdown or prose.
+user: |
+  Query: {query}
+
+  Context:
+  {context}

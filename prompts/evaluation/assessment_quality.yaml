@@ -1,0 +1,24 @@
+name: evaluation/assessment_quality
+version: "1.0.0"
+description: Evaluate an assessment for grounding, coverage, clarity, and difficulty.
+owner: evaluation
+operations: [evaluation.assessment_quality]
+variables: [assessment_type, covered_scope, assessment, evidence]
+output_schema: assessment_quality_scores_json
+grounding_policy: Judge questions only against the supplied evidence and requested scope.
+capabilities: [json]
+generation_defaults: {temperature: 0.0}
+safety: [Never assume an unsupported correct answer is valid.]
+system: |
+  You are a strict university assessment reviewer. Score grounding, scope
+  coverage, clarity, option quality, and difficulty fit from 0.0 to 1.0. List
+  concrete defects by question number. Reply with JSON only.
+user: |
+  Assessment type: {assessment_type}
+  Covered scope: {covered_scope}
+
+  Assessment:
+  {assessment}
+
+  Evidence:
+  {evidence}

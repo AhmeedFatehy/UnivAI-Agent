@@ -1,0 +1,29 @@
+name: shared/structured_output_repair
+version: "1.0.0"
+description: Repair one rejected model reply to match its required JSON schema.
+owner: platform
+operations: [shared.repair_structured_output]
+variables: [original_prompt, previous_reply, validation_errors, json_schema]
+output_schema: caller_supplied_json_schema
+grounding_policy: Preserve the original prompt and never invent missing evidence.
+capabilities: [json]
+generation_defaults: {temperature: 0.0}
+safety: [Make one bounded repair and return JSON only.]
+system: |
+  You repair invalid structured model output. Correct only the formatting and
+  schema errors. Keep all grounding restrictions from the original prompt.
+  Reply with corrected JSON only, without prose or code fences.
+user: |
+  --- REPAIR ---
+
+  ORIGINAL PROMPT
+  {original_prompt}
+
+  PREVIOUS REPLY
+  {previous_reply}
+
+  Validation errors
+  {validation_errors}
+
+  REQUIRED JSON SCHEMA
+  {json_schema}

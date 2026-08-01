@@ -84,7 +84,7 @@ class PromptTemplate(BaseModel):
     system: str = Field(min_length=1)
     user: str = Field(min_length=1)
 
-    def render(self, **values: Any) -> str:
+    def render_user(self, **values: Any) -> str:
         missing = [name for name in self.variables if name not in values]
         if missing:
             raise KeyError(
@@ -103,7 +103,10 @@ class PromptTemplate(BaseModel):
             raise ValueError(
                 f"prompt '{self.name.value}' still contains {leftover} after render"
             )
-        return f"{self.system.strip()}\n\n{body.strip()}"
+        return body.strip()
+
+    def render(self, **values: Any) -> str:
+        return f"{self.system.strip()}\n\n{self.render_user(**values)}"
 
 
 class PromptRegistry(BaseModel):

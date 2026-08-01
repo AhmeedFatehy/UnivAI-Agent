@@ -8,6 +8,7 @@ import logging
 import json
 
 from config import LLM_MODEL
+from agents.prompts import PromptOperation, load_prompt_for
 
 logger = logging.getLogger(__name__)
 
@@ -46,18 +47,7 @@ def decompose_query(query: str) -> list[str]:
     if llm is None:
         return [query]
 
-    prompt = f"""You are a query decomposition assistant. Break the following query into 2-4 simpler, 
-self-contained sub-queries that together cover all aspects of the original question.
-
-Rules:
-- Each sub-query should be a complete, standalone question
-- Keep sub-queries focused and specific
-- If the query is already simple, return just the original query
-- Return ONLY a JSON array of strings, nothing else
-
-Query: {query}
-
-JSON array of sub-queries:"""
+    prompt = load_prompt_for(PromptOperation.RETRIEVAL_DECOMPOSE).render(query=query)
 
     try:
         response = llm.invoke(prompt)
@@ -99,12 +89,7 @@ def expand_query(query: str) -> str:
     if llm is None:
         return query
 
-    prompt = f"""Expand the following search query by adding relevant synonyms and related terms.
-Keep it as a single search query (not a list). Keep it concise (under 50 words).
-
-Original query: {query}
-
-Expanded query:"""
+    prompt = load_prompt_for(PromptOperation.RETRIEVAL_EXPAND).render(query=query)
 
     try:
         response = llm.invoke(prompt)

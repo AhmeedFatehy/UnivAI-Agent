@@ -5,6 +5,8 @@ routes:
   curriculum.generate_semester: curriculum/semester_generation
   curriculum.repair_semester: curriculum/semester_plan_repair
   content.generate_lecture: teaching/lecture_generation
+  content.summarize_lecture: teaching/lecture_summary
+  content.generate_learning_objectives: teaching/learning_objectives
   assessment.generate:quiz: assessment/quiz
   assessment.generate:diagnostic: assessment/diagnostic
   assessment.generate:practice: assessment/practice
@@ -14,6 +16,14 @@ routes:
   assessment.generate:oral_exam: assessment/oral_exam
   assessment.repair_question: assessment/question_repair
   assessment.explain_answer: assessment/answer_explanation
+  retrieval.decompose_query: retrieval/query_decomposition
+  retrieval.expand_query: retrieval/query_expansion
+  retrieval.answer: retrieval/grounded_answer
+  retrieval.refuse: retrieval/grounded_refusal
+  evaluation.retrieval_relevance: evaluation/retrieval_relevance
+  evaluation.answer_groundedness: evaluation/answer_groundedness
+  evaluation.assessment_quality: evaluation/assessment_quality
+  shared.repair_structured_output: shared/structured_output_repair
 aliases:
   programme_planner: curriculum/programme_planner
   lecture: teaching/lecture_generation

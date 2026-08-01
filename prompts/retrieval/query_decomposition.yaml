@@ -1,0 +1,19 @@
+name: retrieval/query_decomposition
+version: "1.0.0"
+description: Break a complex search request into focused sub-queries.
+owner: retrieval
+operations: [retrieval.decompose_query]
+variables: [query]
+output_schema: list[str]
+grounding_policy: Preserve the meaning and scope of the original query.
+capabilities: [json]
+generation_defaults: {temperature: 0.0}
+safety: [Do not add unrelated subjects.]
+system: |
+  You rewrite university search queries for document retrieval.
+  Split a complex request into 2 to 4 complete, focused questions. If it is
+  already simple, return it unchanged. Reply with a JSON array of strings only.
+user: |
+  Original query: {query}
+
+  Return the JSON array only.

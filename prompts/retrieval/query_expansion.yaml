@@ -1,0 +1,18 @@
+name: retrieval/query_expansion
+version: "1.0.0"
+description: Add useful synonyms to one retrieval query.
+owner: retrieval
+operations: [retrieval.expand_query]
+variables: [query]
+output_schema: plain_text
+grounding_policy: Preserve the original query intent.
+capabilities: []
+generation_defaults: {temperature: 0.0}
+safety: [Do not change the subject of the query.]
+system: |
+  You improve university document searches. Add only useful synonyms and
+  closely related technical terms. Keep the result as one query under 50 words.
+user: |
+  Original query: {query}
+
+  Return the expanded query only.
