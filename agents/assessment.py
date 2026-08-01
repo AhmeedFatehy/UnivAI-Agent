@@ -22,9 +22,10 @@ from agents.schemas import (
     ToolCallRecord,
     UngroundedCitation,
     generate_structured,
-    load_prompt,
+    PromptUseRecord,
     resolve_citations,
 )
+from agents.prompts import PromptOperation, load_prompt_for
 from tools.registry import GroundedContext, RetrieveContextInput, call_tool
 
 DEFAULT_QUESTION_COUNT = 4
@@ -78,7 +79,15 @@ class AssessmentAgent:
             task.refuse(context.refusal)
             return None
 
-        prompt = load_prompt("assessment").render(
+        template = load_prompt_for(PromptOperation.ASSESSMENT_QUIZ)
+        task.prompts.append(
+            PromptUseRecord(
+                operation=PromptOperation.ASSESSMENT_QUIZ.value,
+                prompt_id=template.name.value,
+                version=template.version,
+            )
+        )
+        prompt = template.render(
             topic_title=topic_title,
             question_count=question_count,
             evidence=context.as_prompt_block(),

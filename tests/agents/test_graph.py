@@ -12,6 +12,7 @@ import json
 
 import pytest
 
+from agents.prompts import validate_prompt_catalog
 from agents.graph import (
     PROGRAMME_STAGE,
     build_graph,
@@ -574,9 +575,24 @@ def test_the_suite_only_ever_calls_the_injected_model(request_, runtime):
 def test_prompts_are_versioned_and_declare_their_variables():
     for name in ("programme_planner", "lecture", "assessment"):
         template = load_prompt(name)
-        assert template.version == "1.0.0"
+        assert template.version.count(".") == 2
         assert template.variables
         assert "evidence" in template.variables
+        assert template.owner
+        assert template.output_schema
+        assert template.grounding_policy
+
+
+def test_every_prompt_route_resolves_to_a_declared_template():
+    catalog = validate_prompt_catalog()
+    assert len(catalog) == 3
+
+
+def test_the_trace_records_prompt_ids_and_versions(request_, runtime):
+    result = run_programme(request_, runtime)
+    uses = [prompt for task in result.trace.tasks for prompt in task.prompts]
+    assert uses
+    assert all(prompt.prompt_id and prompt.version for prompt in uses)
 
 
 def test_a_prompt_refuses_to_render_with_a_missing_variable():

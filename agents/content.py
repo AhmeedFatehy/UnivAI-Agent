@@ -19,9 +19,10 @@ from agents.schemas import (
     ToolCallRecord,
     UngroundedCitation,
     generate_structured,
-    load_prompt,
+    PromptUseRecord,
     resolve_citations,
 )
+from agents.prompts import PromptOperation, load_prompt_for
 from tools.registry import GroundedContext, RetrieveContextInput, call_tool
 
 DEFAULT_SLIDE_COUNT = 4
@@ -74,7 +75,15 @@ class ContentAgent:
             task.refuse(context.refusal)
             return None
 
-        prompt = load_prompt("lecture").render(
+        template = load_prompt_for(PromptOperation.CONTENT_GENERATE_LECTURE)
+        task.prompts.append(
+            PromptUseRecord(
+                operation=PromptOperation.CONTENT_GENERATE_LECTURE.value,
+                prompt_id=template.name.value,
+                version=template.version,
+            )
+        )
+        prompt = template.render(
             topic_title=topic_title,
             topic_summary=topic_summary,
             slide_count=slide_count,

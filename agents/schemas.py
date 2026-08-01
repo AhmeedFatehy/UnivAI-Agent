@@ -20,13 +20,11 @@ import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum
-from functools import lru_cache
-from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from agents.prompts import PromptTemplate, load_prompt
 from document_processing.metadata import SourceLocation
 from planning.overlap import Topic
 from planning.programme_planner import ProgrammePlan
@@ -34,8 +32,6 @@ from tools.registry import GroundedContext, Refusal
 
 AGENT_SCHEMA = "univai.agent.graph"
 AGENT_SCHEMA_VERSION = "1.0.0"
-
-PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 #: One repair attempt, as the issue specifies. Not configurable upward by
 #: accident — a caller that wants more has to say so explicitly.
@@ -75,6 +71,14 @@ class ToolCallRecord(BaseModel):
     citations: int = Field(default=0, ge=0)
 
 
+class PromptUseRecord(BaseModel):
+    """The stable prompt revision selected for one LLM operation."""
+
+    operation: str = Field(min_length=1)
+    prompt_id: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+
+
 class TaskRecord(BaseModel):
     """Observable state for one unit of agent work."""
 
@@ -85,6 +89,7 @@ class TaskRecord(BaseModel):
     attempts: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=2, ge=1)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+    prompts: list[PromptUseRecord] = Field(default_factory=list)
     llm_calls: int = Field(default=0, ge=0)
     error: str | None = None
     refusal: Refusal | None = None
@@ -510,58 +515,6 @@ def topics_from_extraction(
     return topics
 
 
-# ── Prompt loading ────────────────────────────────────────────────────
-
-
-class PromptTemplate(BaseModel):
-    """A versioned prompt with an explicit list of the variables it expects.
-
-    Substitution replaces only the declared ``{variable}`` names, so the JSON
-    examples and schemas these prompts carry keep their braces intact.
-    """
-
-    name: str
-    version: str
-    description: str = ""
-    variables: list[str] = Field(default_factory=list)
-    system: str = Field(min_length=1)
-    user: str = Field(min_length=1)
-
-    def render(self, **values: Any) -> str:
-        """Fill the template. A missing declared variable is an error."""
-        missing = [name for name in self.variables if name not in values]
-        if missing:
-            raise KeyError(
-                f"prompt '{self.name}' v{self.version} needs {missing}, which were not supplied"
-            )
-
-        body = self.user
-        for name in self.variables:
-            body = body.replace("{" + name + "}", str(values[name]))
-
-        leftover = [
-            name for name in self.variables if "{" + name + "}" in body
-        ]
-        if leftover:  # pragma: no cover — only reachable if a value re-introduces a token
-            raise ValueError(f"prompt '{self.name}' still contains {leftover} after render")
-
-        return f"{self.system.strip()}\n\n{body.strip()}"
-
-
-@lru_cache(maxsize=16)
-def load_prompt(name: str, prompts_dir: str | None = None) -> PromptTemplate:
-    """Load and validate a prompt template from ``prompts/<name>.yaml``."""
-    directory = Path(prompts_dir) if prompts_dir else PROMPTS_DIR
-    path = directory / f"{name}.yaml"
-    if not path.is_file():
-        raise FileNotFoundError(f"prompt template not found: {path}")
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"prompt template {path} must be a YAML mapping")
-    data.setdefault("name", name)
-    return PromptTemplate.model_validate(data)
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -584,6 +537,7 @@ __all__ = [
     "LectureDraftLLM",
     "LectureSegment",
     "PromptTemplate",
+    "PromptUseRecord",
     "StructuredOutputError",
     "TaskRecord",
     "TaskState",

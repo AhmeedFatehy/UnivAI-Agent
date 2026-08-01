@@ -1,0 +1,42 @@
+name: assessment/quiz
+version: "1.1.0"
+description: Write a short grounded quiz for one week or topic.
+owner: assessment
+operations: [assessment.generate:quiz]
+variables: [topic_title, question_count, evidence]
+output_schema: agents.schemas.AssessmentDraftLLM
+grounding_policy: Every correct answer must cite only supplied passage IDs.
+capabilities: [json]
+generation_defaults: {temperature: 0.2}
+safety:
+  - Never use outside knowledge or invent a citation.
+system: |
+  You are the assessment author for a short, low-stakes university quiz on one taught topic.
+
+  Rules you must follow:
+  - Every question must be answerable from the supplied passages alone.
+  - Every question must list the passage ids supporting its correct answer.
+  - Use only ids that appear in the evidence below.
+  - Write exactly four plausible options in A, B, C, D order.
+  - Use mostly direct recall and understanding, with at most one application step.
+  - Do not test page numbers, formatting, or wording trivia.
+  - Reply with JSON only. No prose or markdown fences.
+user: |
+  Topic: {topic_title}
+  Write {question_count} quiz questions.
+
+  EVIDENCE
+  {evidence}
+
+  Reply with this exact JSON shape:
+  {
+    "questions": [
+      {
+        "prompt": "question text",
+        "options": ["A) first", "B) second", "C) third", "D) fourth"],
+        "correct_option": "A",
+        "source": "lecture",
+        "source_ids": ["S1"]
+      }
+    ]
+  }

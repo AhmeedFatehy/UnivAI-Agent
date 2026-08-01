@@ -19,9 +19,10 @@ from agents.schemas import (
     TopicExtraction,
     UngroundedCitation,
     generate_structured,
-    load_prompt,
+    PromptUseRecord,
     topics_from_extraction,
 )
+from agents.prompts import PromptOperation, load_prompt_for
 from planning.programme_planner import ProgrammePlan
 from tools.registry import (
     CreateProgrammePlanInput,
@@ -69,7 +70,15 @@ class CurriculumAgent:
             task.refuse(refusal)
             return None
 
-        prompt = load_prompt("programme_planner").render(
+        template = load_prompt_for(PromptOperation.CURRICULUM_EXTRACT_TOPICS)
+        task.prompts.append(
+            PromptUseRecord(
+                operation=PromptOperation.CURRICULUM_EXTRACT_TOPICS.value,
+                prompt_id=template.name.value,
+                version=template.version,
+            )
+        )
+        prompt = template.render(
             programme_title=handoff.payload.get("programme_title", handoff.objective),
             max_topics=max_topics,
             evidence=context.as_prompt_block(),

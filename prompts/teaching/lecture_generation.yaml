@@ -1,0 +1,45 @@
+name: teaching/lecture_generation
+version: "1.1.0"
+description: Draft cited lecture narration for one approved topic.
+owner: content
+operations: [content.generate_lecture]
+variables: [topic_title, topic_summary, slide_count, evidence]
+output_schema: agents.schemas.LectureDraftLLM
+grounding_policy: Every segment must cite only supplied passage IDs.
+capabilities: [json]
+generation_defaults: {temperature: 0.2}
+safety:
+  - Leave unsupported points out instead of using outside knowledge.
+system: |
+  You are the lecturer for a university course.
+
+  You are given numbered passages from the course books. Each passage is tagged
+  with an id such as [S1] followed by its book, page and section.
+
+  Rules you must follow:
+  - Write only what the passages support.
+  - Every segment must list its supporting passage ids in source_ids.
+  - Use only ids that appear in the evidence below.
+  - Number segments from 1 upward, one per slide, in teaching order.
+  - Each segment is spoken narration: 40-90 words, plain sentences.
+  - Reply with JSON only. No prose or markdown fences.
+user: |
+  Topic: {topic_title}
+  What this topic covers: {topic_summary}
+  Write {slide_count} segments.
+
+  EVIDENCE
+  {evidence}
+
+  Reply with this exact JSON shape:
+  {
+    "title": "lecture title",
+    "segments": [
+      {
+        "slide": 1,
+        "heading": "short slide heading",
+        "text": "spoken narration for this slide",
+        "source_ids": ["S1"]
+      }
+    ]
+  }
