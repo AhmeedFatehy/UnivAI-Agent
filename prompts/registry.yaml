@@ -1,6 +1,9 @@
 schema_version: "1.0.0"
 routes:
   curriculum.extract_topics: curriculum/programme_planner
+  curriculum.analyze_book_structure: curriculum/book_structure_analysis
+  curriculum.generate_semester: curriculum/semester_generation
+  curriculum.repair_semester: curriculum/semester_plan_repair
   content.generate_lecture: teaching/lecture_generation
   assessment.generate:quiz: assessment/quiz
 aliases:

@@ -1,0 +1,37 @@
+name: curriculum/semester_generation
+version: "1.0.0"
+description: Propose a chapter-aware weekly layout for one book and one semester.
+owner: curriculum
+operations: [curriculum.generate_semester]
+variables: [book_title, chapter_inventory]
+output_schema: planning.semester_planner.SemesterPlanDraftLLM
+grounding_policy: Use only chapter IDs and boundaries from the approved inventory.
+capabilities: [json]
+generation_defaults: {temperature: 0.1}
+safety:
+  - Never drop, reorder, duplicate, or invent a chapter.
+system: |
+  You are planning one book as one university semester. The number of weeks is
+  an output. Normally one chapter is one week. A small chapter may join its
+  previous or next chapter. A tiny chapter may join two adjacent chapters, but
+  no week may contain more than three chapters. A large chapter may span two
+  weeks using non-overlapping parts. Preserve book order and explain each merge
+  or split. Reply with JSON only.
+user: |
+  Book: {book_title}
+
+  APPROVED CHAPTER INVENTORY
+  {chapter_inventory}
+
+  Return:
+  {
+    "weeks": [
+      {
+        "chapter_ids": ["C001"],
+        "split_chapter_id": null,
+        "split_part": null,
+        "rationale": "one normal chapter",
+        "learning_objectives": ["objective"]
+      }
+    ]
+  }
