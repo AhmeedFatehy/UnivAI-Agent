@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -34,6 +35,23 @@ class StandaloneAgentTests(unittest.TestCase):
             output = generate_course(self.fixture, Path(directory))
             validate_course(output)
             self.assertEqual(4, len(list(output.glob("week-*"))))
+
+    def test_generation_uses_the_source_section_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "short-course.md"
+            source.write_text(
+                "# Short course\n\n## First chapter\nFirst material.\n\n"
+                "## Second chapter\nSecond material.\n",
+                encoding="utf-8",
+            )
+            output = generate_course(source, root / "output")
+            validate_course(output)
+            self.assertEqual(2, len(list(output.glob("week-*"))))
+            self.assertEqual(
+                2,
+                json.loads((output / "run.json").read_text("utf-8"))["weeks"],
+            )
 
 
 if __name__ == "__main__":

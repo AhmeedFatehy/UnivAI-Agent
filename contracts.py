@@ -40,9 +40,11 @@ def validate_script(data: dict) -> None:
             raise ValueError("citation.page must be a positive integer")
 
 
-def validate_quiz(data: dict) -> None:
-    if not isinstance(data.get("week"), int) or data["week"] not in range(1, 5):
-        raise ValueError("quiz.week must be 1..4")
+def validate_quiz(data: dict, expected_week: int | None = None) -> None:
+    if not isinstance(data.get("week"), int) or data["week"] < 1:
+        raise ValueError("quiz.week must be a positive integer")
+    if expected_week is not None and data["week"] != expected_week:
+        raise ValueError(f"quiz.week must match week-{expected_week}")
     questions = data.get("questions")
     if not isinstance(questions, list) or not questions:
         raise ValueError("quiz.questions must be non-empty")
@@ -59,9 +61,19 @@ def validate_quiz(data: dict) -> None:
 
 
 def validate_course(root: Path) -> None:
-    for week in range(1, 5):
-        folder = root / f"week-{week}"
+    folders = sorted(
+        (folder for folder in root.glob("week-*") if folder.is_dir()),
+        key=lambda folder: int(folder.name.removeprefix("week-")),
+    )
+    if not folders:
+        raise ValueError("course must contain at least one week")
+    weeks = [int(folder.name.removeprefix("week-")) for folder in folders]
+    if weeks != list(range(1, len(weeks) + 1)):
+        raise ValueError("course weeks must be contiguous and start at 1")
+    for week, folder in zip(weeks, folders):
         validate_script(json.loads((folder / "script.json").read_text(encoding="utf-8")))
-        validate_quiz(json.loads((folder / "quiz.json").read_text(encoding="utf-8")))
+        validate_quiz(
+            json.loads((folder / "quiz.json").read_text(encoding="utf-8")), week
+        )
         if not (folder / "slides.md").is_file():
             raise ValueError(f"week-{week}/slides.md is missing")
