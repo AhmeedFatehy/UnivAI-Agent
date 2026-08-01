@@ -1,0 +1,66 @@
+# System prompt catalog
+
+All UnivAI Agent system prompts live in this folder. Python code selects a
+prompt by `PromptOperation`; it must not choose a YAML filename directly.
+`registry.yaml` is the single operation-to-prompt map.
+
+## Folder map
+
+| Folder | Used for |
+|---|---|
+| `curriculum/` | book structure, topic extraction, semester planning and repair |
+| `teaching/` | lecture writing, summaries and learning objectives |
+| `assessment/` | one prompt per assessment type, repair and explanations |
+| `retrieval/` | query rewriting, grounded answers and refusals |
+| `evaluation/` | retrieval, answer and assessment quality checks |
+| `shared/` | structured-output repair shared by every agent |
+
+## Semester rules
+
+The approved chapter inventory is the source of truth. The semester prompt may
+propose a layout, but `planning/semester_planner.py` enforces these rules:
+
+- one normal chapter is one week;
+- adjacent small chapters may be combined;
+- a tiny chapter may share with two adjacent chapters;
+- no week contains more than three chapters;
+- one large chapter may be split into exactly two complete, non-overlapping weeks;
+- chapters cannot be dropped, invented, duplicated, reordered, or grouped when non-adjacent.
+
+If headings cannot be found, the planner records a low-confidence warning and
+treats the readable book as one chapter. A very large fallback chapter can
+still become two weeks. The upload generator saves the validated result as
+`semester-plan.json` so other endpoints can use the same week boundaries.
+
+## Assessment routing
+
+These operations intentionally use different prompts:
+
+| Assessment | Operation | Prompt |
+|---|---|---|
+| Diagnostic | `assessment.generate:diagnostic` | `assessment/diagnostic.yaml` |
+| Practice | `assessment.generate:practice` | `assessment/practice.yaml` |
+| Quiz | `assessment.generate:quiz` | `assessment/quiz.yaml` |
+| Assignment | `assessment.generate:assignment` | `assessment/assignment.yaml` |
+| Midterm | `assessment.generate:midterm` | `assessment/midterm.yaml` |
+| Final | `assessment.generate:final` | `assessment/final.yaml` |
+| Oral exam | `assessment.generate:oral_exam` | `assessment/oral_exam.yaml` |
+
+Every assessment receives a covered scope, question count, difficulty mix,
+allowed formats, and grounded evidence. Every returned assessment records its
+type and rejects a reply that claims to be a different type.
+
+## Adding or changing a prompt
+
+1. Add one stable ID to `PromptId` and one caller-facing operation to
+   `PromptOperation` in `agents/prompts.py`.
+2. Add the YAML file with its version, owner, variables, output schema,
+   grounding policy, safety rules, system message, and user template.
+3. Map the operation to the prompt ID in `registry.yaml`.
+4. Load it with `load_prompt_for(PromptOperation.…)` in the caller.
+5. Add or update a test and run `uv run pytest -q`.
+
+`validate_prompt_catalog()` fails if an enum operation has no route, a prompt
+ID has no route, a YAML file is missing or extra, two prompts claim the same
+operation, or required template variables are not supplied. Prompt changes
+use semantic versions so traces can show exactly which prompt produced output.

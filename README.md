@@ -44,6 +44,11 @@ The main repository keeps invoking generation with:
 python UnivAI-Agent/generation/lecture_gen.py <absolute_pdf_path> <book_id>
 ```
 
+Generation first discovers grounded chapter boundaries and writes
+`lectures/<studentId>/semester-plan.json`. Normal chapters take one week,
+adjacent small chapters may share a week (never more than three), and a large
+chapter may take two weeks. The number of weeks is not fixed.
+
 Set `UNIVAI_INTEGRATION_ROOT` only when the Agent is not located directly
 inside the main checkout. Integrated mode fails clearly if the parent shared
 services are missing and never falls back to fixtures.
@@ -68,6 +73,7 @@ services are missing and never falls back to fixtures.
 | `vector_store/` | embedding + Qdrant indexing |
 | `retrieval/` | search + reranking |
 | `evaluation/` | retrieval quality experiments |
+| `prompts/` | versioned system prompts and the operation-to-prompt registry |
 | `agent.py`, `app.py` | the conversational agent + its own API |
 
 ## Consumed by
