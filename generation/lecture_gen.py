@@ -1,4 +1,4 @@
-"""Turn the uploaded book into the 4-week course: slides, narration, quizzes.
+"""Turn an uploaded book into a chapter-aware course with slides and quizzes.
 
     python UnivAI-Agent/generation/lecture_gen.py <absolute_pdf_path> <book_id>   (from the campus root)
 
@@ -32,11 +32,19 @@ if str(AGENT_ROOT) not in sys.path:
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+from agents.prompts import PromptOperation, load_prompt_for
+from planning.semester_planner import (
+    SemesterWeek,
+    SemesterWeekPlan,
+    discover_chapters,
+    pages_for_week,
+    plan_semester,
+)
+
 # The Brain cave is checked out inside the UnivAI campus repo; the shared
 # plumbing (db, LLM adapter) lives there in services/.
 ROOT = Path(__file__).resolve().parents[2]  # the UnivAI campus root
 LECTURES_DIR = ROOT / "lectures"
-WEEKS = 4
 execute = None
 fetch_one = None
 complete = None
@@ -88,16 +96,8 @@ MAX_SOURCE_CHARS = 12000
 MAX_CHARS_PER_PAGE = 1500
 ATTEMPTS = 4
 
-LECTURE_SYSTEM = (
-    "You build university lecture material strictly from the textbook pages given. "
-    "Never use outside knowledge. Reply with VALID JSON only - no prose, no markdown fences."
-)
-
-QUIZ_SYSTEM = (
-    "You write exam questions strictly from the textbook pages given. Every question "
-    "must be answerable from those pages alone. Reply with VALID JSON only - no prose, "
-    "no markdown fences."
-)
+LECTURE_SYSTEM = load_prompt_for(PromptOperation.CONTENT_GENERATE_LECTURE).system
+QUIZ_SYSTEM = load_prompt_for(PromptOperation.ASSESSMENT_QUIZ).system
 
 
 def progress(book_id: int, message: str) -> None:
@@ -124,19 +124,23 @@ def read_pages(pdf_path: Path) -> list[tuple[int, str]]:
     return pages
 
 
-def split_weeks(pages: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
-    """Contiguous quarters of the book, one per week."""
+def build_semester_plan(
+    pages: list[tuple[int, str]], book_title: str
+) -> tuple[SemesterWeekPlan, list[tuple[SemesterWeek, list[tuple[int, str]]]]]:
+    """Discover chapters, enforce the semester rules, and bind real pages."""
     if not pages:
         raise RuntimeError("no readable text in the book - is it scanned images?")
-    if len(pages) < WEEKS:
-        # A tiny document still becomes a course: later weeks revisit the last
-        # pages rather than refusing outright.
-        return [[pages[min(week, len(pages) - 1)]] for week in range(WEEKS)]
-    per_week = len(pages) / WEEKS
-    return [
-        pages[round(week * per_week) : round((week + 1) * per_week)]
-        for week in range(WEEKS)
-    ]
+    inventory = discover_chapters(pages, book_title)
+    plan = plan_semester(inventory)
+    return plan, [(week, pages_for_week(week, pages)) for week in plan.weeks]
+
+
+def write_semester_plan(sid: str, plan: SemesterWeekPlan) -> None:
+    folder = LECTURES_DIR / sid
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "semester-plan.json").write_text(
+        plan.model_dump_json(indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def source_block(pages: list[tuple[int, str]]) -> str:
@@ -190,13 +194,21 @@ def ask_json(prompt: str, system: str, max_tokens: int, check) -> dict:
     """complete() then validate; retry with the rejection explained, and hand the
     LAST attempt to the fallback model - a repeated JSON failure is an output-
     quality problem, and availability-failover alone would never switch models."""
+    generation_model = os.getenv("LLM_GENERATION", "").strip() or None
     fallback = os.getenv("LLM_FALLBACK", "").strip() or None
+    repair_template = load_prompt_for(PromptOperation.SHARED_REPAIR_JSON)
     last = "no attempts made"
-    suffix = ""
+    current_prompt = prompt
     for attempt in range(1, ATTEMPTS + 1):
-        force = fallback if (attempt == ATTEMPTS and fallback) else None
+        force = fallback if (attempt == ATTEMPTS and fallback) else generation_model
         try:
-            result = complete(prompt + suffix, system, max_tokens=max_tokens, force_spec=force)
+            result = complete(
+                current_prompt,
+                system,
+                max_tokens=max_tokens,
+                force_spec=force,
+                json_mode=True,
+            )
         except LLMError as exc:
             last = str(exc)
             continue
@@ -208,10 +220,11 @@ def ask_json(prompt: str, system: str, max_tokens: int, check) -> dict:
         print(f"[lecture-gen] retrying - {last}", flush=True)
         print(f"[lecture-gen]   reply began: {result.text[:200]!r}", flush=True)
         print(f"[lecture-gen]   reply ended: {result.text[-200:]!r}", flush=True)
-        suffix = (
-            f"\n\nIMPORTANT: your previous reply was rejected ({problem}). "
-            "Reply with ONLY the JSON object - no explanation, no markdown, "
-            'starting with { and ending with }. Escape any double quotes inside strings as \\".'
+        current_prompt = repair_template.render(
+            original_prompt=prompt,
+            previous_reply=result.text[:2000],
+            validation_errors=problem,
+            json_schema="Use the exact JSON shape and rules in the original prompt.",
         )
     raise RuntimeError(f"model never produced valid JSON ({last})")
 
@@ -245,11 +258,17 @@ def check_lecture(data: dict) -> str | None:
     return None
 
 
-def generate_week(week: int, pages: list[tuple[int, str]]) -> dict:
+def generate_week(
+    week: int,
+    total_weeks: int,
+    assigned_chapters: str,
+    pages: list[tuple[int, str]],
+) -> dict:
     valid_pages = [number for number, _ in pages]
     prompt = (
         f"These are pages {valid_pages[0]}-{valid_pages[-1]} of a textbook. "
-        f"Create lecture {week} of a {WEEKS}-week course from them.\n\n"
+        f"Create lecture {week} of a {total_weeks}-week course from them. "
+        f"This week covers: {assigned_chapters}.\n\n"
         "Return exactly this JSON shape:\n"
         "{\n"
         '  "title": "short lecture title",\n'
@@ -438,6 +457,8 @@ def build_slides(sid: str) -> None:
         cwd=ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=15 * 60,
     )
     if result.returncode != 0:
@@ -453,6 +474,8 @@ def prerender_voice(sid: str) -> None:
         cwd=ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30 * 60,
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
@@ -463,13 +486,19 @@ def prerender_voice(sid: str) -> None:
 # ---------------------------------------------------------------- main
 
 
-def regenerate_quizzes(sid: str, book_id: int, weeks: list[list[tuple[int, str]]]) -> None:
+def regenerate_quizzes(
+    sid: str,
+    book_id: int,
+    weeks: list[tuple[SemesterWeek, list[tuple[int, str]]]],
+) -> None:
     """Rewrite only quiz.json per week, from the ALREADY generated lecture scripts."""
-    for week, week_pages in enumerate(weeks, start=1):
+    total_weeks = len(weeks)
+    for planned_week, week_pages in weeks:
+        week = planned_week.week
         script = json.loads(
             (LECTURES_DIR / sid / f"week-{week}" / "script.json").read_text("utf-8")
         )
-        progress(book_id, f"Rewriting quiz {week} of {WEEKS} — “{script['title']}”…")
+        progress(book_id, f"Rewriting quiz {week} of {total_weeks} — “{script['title']}”…")
         quiz = generate_quiz(script["title"], script["segments"], week_pages)
         (LECTURES_DIR / sid / f"week-{week}" / "quiz.json").write_text(
             json.dumps(
@@ -503,12 +532,13 @@ def main() -> int:
         source = args.source.resolve()
         output = args.output_root.resolve() if args.output_root else standalone_root() / "output"
         generate_course(source, output)
+        run = json.loads((output / "run.json").read_text(encoding="utf-8"))
         print(
             json.dumps(
                 {
                     "ok": True,
                     "mode": "standalone",
-                    "weeks": WEEKS,
+                    "weeks": run["weeks"],
                     "output": str(output),
                     "side_effects": "database, Slidev, and voice prerender skipped",
                 }
@@ -524,7 +554,7 @@ def main() -> int:
     book_id = int(sys.argv[2])
     quizzes_only = "--quizzes-only" in sys.argv[3:]
 
-    book = fetch_one("SELECT id, student_id FROM books WHERE id = %s", (book_id,))
+    book = fetch_one("SELECT id, student_id, title, filename FROM books WHERE id = %s", (book_id,))
     if not book:
         print(json.dumps({"ok": False, "error": f"no book with id {book_id}"}))
         return 2
@@ -546,22 +576,28 @@ def main() -> int:
         progress(book_id, "Reading the book…")
         pages = read_pages(pdf_path)
         execute("UPDATE books SET pages = %s WHERE id = %s", (len(pages), book_id))
-        weeks = split_weeks(pages)
+        book_title = book.get("title") or book.get("filename") or pdf_path.stem
+        progress(book_id, "Finding chapters and planning the semester…")
+        plan, weeks = build_semester_plan(pages, book_title)
+        total_weeks = plan.week_count
+        write_semester_plan(sid, plan)
 
         if quizzes_only:
             regenerate_quizzes(sid, book_id, weeks)
             execute(
                 "UPDATE books SET status = 'ready', progress = %s WHERE id = %s",
-                (f"Quizzes rewritten — {WEEKS} weeks.", book_id),
+                (f"Quizzes rewritten — {total_weeks} weeks.", book_id),
             )
-            print(json.dumps({"ok": True, "weeks": WEEKS, "quizzes_only": True}))
+            print(json.dumps({"ok": True, "weeks": total_weeks, "quizzes_only": True}))
             return 0
 
-        for week, week_pages in enumerate(weeks, start=1):
+        for planned_week, week_pages in weeks:
+            week = planned_week.week
             first, last = week_pages[0][0], week_pages[-1][0]
-            progress(book_id, f"Writing lecture {week} of {WEEKS} (pages {first}-{last})…")
-            lecture = generate_week(week, week_pages)
-            progress(book_id, f"Writing quiz {week} of {WEEKS} — “{lecture['title']}”…")
+            chapter_titles = "; ".join(part.title for part in planned_week.chapters)
+            progress(book_id, f"Writing lecture {week} of {total_weeks} (pages {first}-{last})…")
+            lecture = generate_week(week, total_weeks, chapter_titles, week_pages)
+            progress(book_id, f"Writing quiz {week} of {total_weeks} — “{lecture['title']}”…")
             spoken = [{"text": lecture["intro"]}] + [
                 {"text": slide["narration"]} for slide in lecture["slides"]
             ]
@@ -580,9 +616,9 @@ def main() -> int:
 
         execute(
             "UPDATE books SET status = 'ready', progress = %s WHERE id = %s",
-            (f"Course ready — {WEEKS} lectures generated from {len(pages)} pages.", book_id),
+            (f"Course ready — {total_weeks} lectures generated from {len(pages)} pages.", book_id),
         )
-        print(json.dumps({"ok": True, "weeks": WEEKS, "pages": len(pages)}))
+        print(json.dumps({"ok": True, "weeks": total_weeks, "pages": len(pages)}))
         return 0
     except Exception as exc:  # noqa: BLE001 - a failed run must land in books.error
         detail = f"{type(exc).__name__}: {exc}"

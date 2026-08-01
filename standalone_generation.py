@@ -1,4 +1,4 @@
-"""Deterministic four-week course generation for explicit standalone mode."""
+"""Deterministic section-aware course generation for explicit standalone mode."""
 
 from __future__ import annotations
 
@@ -8,18 +8,13 @@ from pathlib import Path
 
 from contracts import validate_course
 
-WEEKS = 4
-
-
 def _source_sections(source: Path) -> list[str]:
     text = source.read_text(encoding="utf-8")
     parts = [part.strip() for part in re.split(r"\n(?=## )", text) if part.strip()]
     body = [part for part in parts if part.startswith("## ")]
     if not body:
         raise ValueError("standalone source needs Markdown level-two sections")
-    while len(body) < WEEKS:
-        body.append(body[-1])
-    return body[:WEEKS]
+    return body
 
 
 def _question(week: int, index: int, source: str) -> dict:
@@ -40,6 +35,7 @@ def _question(week: int, index: int, source: str) -> dict:
 
 def generate_course(source: Path, output_root: Path) -> Path:
     sections = _source_sections(source)
+    week_count = len(sections)
     output_root.mkdir(parents=True, exist_ok=True)
     for week, section in enumerate(sections, start=1):
         lines = [line.strip("# ").strip() for line in section.splitlines() if line.strip()]
@@ -96,7 +92,7 @@ def generate_course(source: Path, output_root: Path) -> Path:
         json.dumps(
             {
                 "mode": "standalone",
-                "weeks": WEEKS,
+                "weeks": week_count,
                 "integration_side_effects": {
                     "database": "skipped",
                     "slide_build": "skipped",
