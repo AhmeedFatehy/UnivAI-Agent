@@ -24,6 +24,17 @@ def build_mcp_client():
 from langchain.messages import AIMessage
 
 async def run_agent_stream(user_query, thread_id="session_001"):
+    from guardrails.input import classify_user_input
+
+    decision = classify_user_input(user_query)
+    if not decision.safe:
+        yield (
+            "REFUSED: this request looks like a prompt-injection attempt "
+            f"(matched: {', '.join(decision.matched_rules)}). The request is not "
+            "allowed to override the assistant's instructions, tools or grounding."
+        )
+        return
+
     client = build_mcp_client()
 
     system_prompt = load_prompt_for(PromptOperation.RETRIEVAL_ANSWER).system

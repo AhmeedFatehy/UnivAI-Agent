@@ -14,6 +14,7 @@ from agents.schemas import (
     Lecture,
     LectureDraftLLM,
     LectureSegment,
+    ServingRecord,
     StructuredOutputError,
     TaskRecord,
     ToolCallRecord,
@@ -97,6 +98,13 @@ class ContentAgent:
                 LectureDraftLLM,
                 repair_attempts=self.runtime.repair_attempts,
                 on_call=lambda: setattr(task, "llm_calls", task.llm_calls + 1),
+                on_served=lambda serving: task.record_serving(
+                    ServingRecord(
+                        **serving.model_dump(exclude_none=True),
+                        prompt_id=template.name.value,
+                        prompt_version=template.version,
+                    )
+                ),
             )
             segments = [
                 LectureSegment(

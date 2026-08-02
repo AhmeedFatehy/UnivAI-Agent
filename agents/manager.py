@@ -34,6 +34,7 @@ from agents.schemas import (
     TaskRecord,
 )
 from planning.programme_planner import ProgrammePlan
+from telemetry.tracing import RuntimeFingerprint, runtime_fingerprint
 from tools.registry import Refusal, ToolContext
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,11 @@ class AgentRuntime:
     max_steps: int = DEFAULT_MAX_STEPS
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     topic_budget: int = DEFAULT_TOPIC_BUDGET
+    fingerprint: RuntimeFingerprint | None = None
+
+    def __post_init__(self) -> None:
+        if self.fingerprint is None:
+            self.fingerprint = runtime_fingerprint()
 
 
 @dataclass
@@ -252,6 +258,19 @@ def ollama_llm(model: str | None = None, base_url: str | None = None) -> Callabl
     return call
 
 
+def resilient_ollama_llm() -> "ResilientLLM":
+    """The integrated resilient model: primary with a configured fallback.
+
+    Wraps :class:`resilience.fallback.ResilientLLM` so the same agent graph that
+    accepts a plain ``str -> str`` callable also records which model served each
+    reply and why a fallback happened. Unit tests never call this — they inject
+    their own backends via :func:`agents.manager.AgentRuntime`.
+    """
+    from resilience.fallback import build_resilient_llm
+
+    return build_resilient_llm()
+
+
 __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_MAX_STEPS",
@@ -260,4 +279,5 @@ __all__ = [
     "ManagerAgent",
     "ProgrammeRequest",
     "ollama_llm",
+    "resilient_ollama_llm",
 ]
