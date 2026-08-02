@@ -14,7 +14,7 @@ passages are relevant, not into producing prose.
 | Capability | Chosen model | Why |
 | --- | --- | --- |
 | Main assistant | `qwen3:4b-instruct` | Balances Arabic/English instruction following with latency acceptable for interactive chat; runs on a single consumer GPU. |
-| Plan and lecture generation | Same routed LLM | Generation inherits retrieval-grounding; a larger model did not measurably improve plan quality on the held-out rubric. |
+| Plan and lecture generation | Same routed LLM | Generation inherits retrieval-grounding and keeps the single-host deployment simple. This choice is provisional until the approved evaluation fixture is available. |
 | Judge (evaluation) | Same routed LLM, invoked by a strict prompt | The judge validates faithfulness and relevance from the same context the answer used; a separate judge model would only add a second untrusted opinion, not evidence. |
 | Fallback | `qwen3:0.6b-instruct` | Small enough to start even when the primary is unavailable; used only for availability, never for novel content. The fallback is bounded and recorded as such in trace metadata. |
 
@@ -26,9 +26,10 @@ passages are relevant, not into producing prose.
 | Sparse `Qdrant/bm25` | Exact-term recall for course-specific jargon (catalog numbers, tool names) that dense embeddings flatten. |
 | Reranker `Xenova/ms-marco-MiniLM-L-6-v2` | Cross-encoder relevance is the strongest single predictor of retrieval quality; applied to the top candidates only, keeping it cheap. |
 
-Selection was validated against a grounded RAG dataset; the acceptance
-thresholds (`context_recall >= 0.60`, `faithfulness >= 0.70`) live in
-`evaluation/report.py` and are enforced by the evaluation runner.
+The configured acceptance thresholds (`context_recall >= 0.60`,
+`faithfulness >= 0.70`) live in `evaluation/report.py` and are enforced by the
+evaluation runner. They are policy targets, not measured results. The required
+50-case run is **NOT RUN** because the approved Core fixture is not yet present.
 
 ## Deliberate rejections
 

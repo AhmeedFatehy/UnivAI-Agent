@@ -52,10 +52,12 @@ def context_precision(relevant: Sequence[str], retrieved: Sequence[str]) -> floa
     relevant_set = set(relevant)
     hits = 0
     total = 0.0
+    seen: set[str] = set()
     for index, document_id in enumerate(retrieved, start=1):
-        if document_id in relevant_set:
+        if document_id in relevant_set and document_id not in seen:
             hits += 1
             total += hits / index
+            seen.add(document_id)
     return round(total / hits, 6) if hits else 0.0
 
 
@@ -64,7 +66,7 @@ def context_recall(relevant: Sequence[str], retrieved: Sequence[str]) -> float:
     relevant_set = set(relevant)
     if not relevant_set:
         return 0.0
-    found = sum(1 for document_id in retrieved if document_id in relevant_set)
+    found = len(relevant_set.intersection(retrieved))
     return round(found / len(relevant_set), 6)
 
 

@@ -99,6 +99,17 @@ class ModelBackend(Protocol):
         ...
 
 
+@dataclass
+class _CallableBackend:
+    """Concrete backend wrapper for a dynamically constructed callable."""
+
+    spec: ModelSpec
+    callback: Callable[[str], ServedResult]
+
+    def complete(self, prompt: str) -> ServedResult:
+        return self.callback(prompt)
+
+
 class FallbackExhausted(RuntimeError):
     """Every configured model failed; nothing permissive was returned."""
 
@@ -143,7 +154,10 @@ def execute_with_fallback(
         try:
             result = backend.complete(prompt)
         except Exception as error:  # noqa: BLE001 - a backend failure is the point
-            reasons.append(f"{type(error).__name__}: {error}")
+            # Provider exceptions can include request bodies, prompts, URLs or
+            # credentials. Keep the operational error type, but never persist
+            # the backend-supplied message in serving metadata or logs.
+            reasons.append(type(error).__name__)
             if on_error is not None:
                 on_error(backend, error)
             if on_fallback is not None and index < len(candidates) - 1:
@@ -246,11 +260,7 @@ def _ollama_backend(
             metadata={"raw": raw},
         )
 
-    class _OllamaBackend:
-        spec = spec
-        complete = staticmethod(complete)
-
-    return _OllamaBackend()
+    return _CallableBackend(spec=spec, callback=complete)
 
 
 class OllamaBackend:

@@ -8,7 +8,9 @@ explicitly rather than returning permissive garbage.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +18,7 @@ from resilience.fallback import (
     FallbackExhausted,
     ModelBackend,
     ModelSpec,
+    OllamaBackend,
     ResilientLLM,
     ServedResult,
     execute_with_fallback,
@@ -77,7 +80,8 @@ def test_fallback_serves_when_the_primary_fails():
     assert result.text == "fallback ok"
     assert result.fallback_used is True
     assert result.fallback_reason is not None
-    assert "connection refused" in result.fallback_reason
+    assert result.fallback_reason == "RuntimeError"
+    assert "connection refused" not in result.fallback_reason
     assert result.attempts == 2
     assert result.model == "fallback-model"
     assert primary.calls == 1
@@ -113,6 +117,17 @@ def test_exhaustion_fails_explicitly_and_bounded():
     assert primary.calls == 1
     assert fallback.calls == 1, "each backend is attempted exactly once"
     assert len(on_error) == 2
+
+
+def test_backend_errors_do_not_leak_messages_into_exhaustion_metadata():
+    secret = "Bearer secret-token prompt=private"
+    primary = FakeBackend(spec(), fail_with=RuntimeError(secret))
+
+    with pytest.raises(FallbackExhausted) as error:
+        execute_with_fallback("prompt", primary)
+
+    assert error.value.reasons == ["RuntimeError"]
+    assert secret not in str(error.value)
 
 
 def test_multiple_fallbacks_are_tried_in_order():
@@ -198,3 +213,23 @@ def test_model_spec_requires_provider_and_model():
         ModelSpec(provider="", model="x")
     with pytest.raises(ValueError):
         ModelSpec(provider="ollama", model="")
+
+
+def test_ollama_backend_factory_exposes_the_requested_spec(monkeypatch):
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setitem(
+        sys.modules,
+        "langchain_ollama",
+        SimpleNamespace(ChatOllama=FakeChatOllama),
+    )
+
+    backend = OllamaBackend(
+        provider="ollama",
+        model="primary-model",
+        base_url="http://localhost:11434",
+    )
+
+    assert backend.spec == ModelSpec(provider="ollama", model="primary-model")

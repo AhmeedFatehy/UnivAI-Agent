@@ -262,6 +262,11 @@ def create_programme_plan(
         capacity_hours: Hours one semester can absorb.
         max_semesters: Upper bound on semesters.
     """
+    for model_input in [programme_title, *seed_queries]:
+        blocked = _screen_user_query(model_input)
+        if blocked is not None:
+            return blocked
+
     try:
         from agents.graph import run_programme
         from agents.manager import AgentRuntime, ProgrammeRequest, resilient_ollama_llm

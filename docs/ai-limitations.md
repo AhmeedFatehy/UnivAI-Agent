@@ -13,9 +13,10 @@ exfiltration requests, injected delimiters) with no model in the loop. It is
 - Novel or obfuscated attack strings can pass screening; this is mitigated by
   the grounding gate — retrieved source text is treated as data, never as
   instructions — not by perfect classification.
-- Screened source text is still surfaced to the user; the guarantee is that it
-  cannot change the agent's behaviour, not that it cannot influence a human
-  reader. Flagged documents are surfaced with `source_injection_flagged`.
+- Raw retrieval results retain flagged source text for operator inspection and
+  mark it with `source_injection_flagged`. The grounded tool excludes flagged
+  passages from model evidence; if every matching passage is flagged, it
+  returns an explicit refusal.
 
 ## The fallback buys availability, not correctness
 
