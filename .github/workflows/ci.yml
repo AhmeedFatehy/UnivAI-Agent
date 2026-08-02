@@ -36,5 +36,7 @@ jobs:
         run: uv run python -m compileall -q -x '(\.venv|\.git)' .
       - name: Test
         run: uv run pytest tests
+      - name: Evaluate RAG quality
+        run: uv run pytest tests/evaluation -q
       - name: Check whitespace
         run: git diff --check

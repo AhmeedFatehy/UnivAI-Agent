@@ -255,6 +255,7 @@ def run_programme(
     graph = graph or build_graph()
     manager = ManagerAgent(runtime)
     trace = AgentTrace()
+    trace.fingerprint = runtime.fingerprint
 
     initial: GraphState = {
         "request": request,

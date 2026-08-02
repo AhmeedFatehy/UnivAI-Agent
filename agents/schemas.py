@@ -28,6 +28,11 @@ from agents.prompts import PromptOperation, PromptTemplate, load_prompt, load_pr
 from document_processing.metadata import SourceLocation
 from planning.overlap import Topic
 from planning.programme_planner import ProgrammePlan
+from telemetry.tracing import (
+    RuntimeFingerprint,
+    ServingRecord,
+    new_trace_id,
+)
 from tools.registry import GroundedContext, Refusal
 
 AGENT_SCHEMA = "univai.agent.graph"
@@ -101,6 +106,7 @@ class TaskRecord(BaseModel):
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     prompts: list[PromptUseRecord] = Field(default_factory=list)
     llm_calls: int = Field(default=0, ge=0)
+    servings: list[ServingRecord] = Field(default_factory=list)
     error: str | None = None
     refusal: Refusal | None = None
     started_at: str | None = None
@@ -126,14 +132,19 @@ class TaskRecord(BaseModel):
         self.error = error
         self.finished_at = _now()
 
+    def record_serving(self, serving: ServingRecord) -> None:
+        self.servings.append(serving)
+
     @property
     def exhausted(self) -> bool:
         return self.attempts >= self.max_attempts
 
 
 class AgentTrace(BaseModel):
-    """Everything the graph did, in order."""
+    """Everything the graph did, in order, under one correlated trace id."""
 
+    trace_id: str = Field(default_factory=new_trace_id)
+    fingerprint: RuntimeFingerprint | None = None
     tasks: list[TaskRecord] = Field(default_factory=list)
     steps: int = Field(default=0, ge=0)
 
@@ -155,6 +166,10 @@ class AgentTrace(BaseModel):
     @property
     def refusals(self) -> list[Refusal]:
         return [task.refusal for task in self.tasks if task.refusal is not None]
+
+    @property
+    def servings(self) -> list[ServingRecord]:
+        return [serving for task in self.tasks for serving in task.servings]
 
     def states(self) -> dict[str, str]:
         return {task.task_id: task.state.value for task in self.tasks}
@@ -411,12 +426,18 @@ def generate_structured(
     *,
     repair_attempts: int = DEFAULT_REPAIR_ATTEMPTS,
     on_call: Callable[[], None] | None = None,
+    on_served: Callable[[ServingRecord], None] | None = None,
 ) -> ModelT:
     """Call the model and return a validated instance of ``schema``.
 
     On invalid output, one repair prompt is sent containing the exact validation
     error and the JSON schema. If that also fails, :class:`StructuredOutputError`
     is raised — arbitrary malformed output is never returned to a caller.
+
+    ``on_served`` is invoked after every model attempt with a
+    :class:`~telemetry.tracing.ServingRecord` describing which provider/model
+    served the reply (when the LLM exposes one) — the wiring that puts serving
+    metadata on the task trace without the agent reading private prompts.
     """
     if repair_attempts < 0:
         raise ValueError("repair_attempts cannot be negative")
@@ -429,6 +450,7 @@ def generate_structured(
         if on_call is not None:
             on_call()
         last_raw = llm(current_prompt) or ""
+        _record_serving(llm, on_served)
         try:
             payload = json.loads(extract_json(last_raw))
         except (json.JSONDecodeError, TypeError) as error:
@@ -444,6 +466,19 @@ def generate_structured(
         current_prompt = _repair_prompt(prompt, last_raw, last_error, schema)
 
     raise StructuredOutputError(schema.__name__, repair_attempts + 1, last_error, last_raw)
+
+
+def _record_serving(
+    llm: Callable[[str], str],
+    on_served: Callable[[ServingRecord], None] | None,
+) -> None:
+    """Forward the LLM's last served result, when it exposes one and a listener wants it."""
+    if on_served is None:
+        return
+    last_served = getattr(llm, "last_served", None)
+    if last_served is None:
+        return
+    on_served(ServingRecord.from_served(last_served))
 
 
 def _compact_validation_error(error: ValidationError) -> str:
@@ -568,6 +603,8 @@ __all__ = [
     "LectureSegment",
     "PromptTemplate",
     "PromptUseRecord",
+    "RuntimeFingerprint",
+    "ServingRecord",
     "StructuredOutputError",
     "TaskRecord",
     "TaskState",

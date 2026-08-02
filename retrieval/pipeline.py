@@ -100,8 +100,27 @@ def retrieve(
     for i, doc in enumerate(unique_results):
         _promote_citation_fields(doc)
         doc["citation"] = _format_citation(doc, rank=i + 1)
+        _screen_source(doc)
 
     return unique_results
+
+
+def _screen_source(doc: dict) -> dict:
+    """Flag retrieved text that carries embedded instruction material.
+
+    Source text is quoted data and never instruction authority: the passage is
+    still returned (a real book may legitimately discuss prompts or systems),
+    but an indirect-injection marker is recorded so callers and traces can see
+    the risk. The grounding gate decides what an answer may actually cite.
+    """
+    from guardrails.input import classify_source_text
+
+    content = doc.get("content") or ""
+    decision = classify_source_text(content)
+    doc["source_injection_flagged"] = not decision.safe
+    if not decision.safe:
+        doc["source_injection_rules"] = list(decision.matched_rules)
+    return doc
 
 
 def build_source_filters(

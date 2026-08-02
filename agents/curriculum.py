@@ -13,6 +13,7 @@ from __future__ import annotations
 from agents.schemas import (
     AgentName,
     Handoff,
+    ServingRecord,
     StructuredOutputError,
     TaskRecord,
     ToolCallRecord,
@@ -91,6 +92,13 @@ class CurriculumAgent:
                 TopicExtraction,
                 repair_attempts=self.runtime.repair_attempts,
                 on_call=lambda: setattr(task, "llm_calls", task.llm_calls + 1),
+                on_served=lambda serving: task.record_serving(
+                    ServingRecord(
+                        **serving.model_dump(exclude_none=True),
+                        prompt_id=template.name.value,
+                        prompt_version=template.version,
+                    )
+                ),
             )
             topics = topics_from_extraction(extraction, context)
         except (StructuredOutputError, UngroundedCitation, ValueError) as error:

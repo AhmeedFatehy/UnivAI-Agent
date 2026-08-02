@@ -26,6 +26,9 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 # ── LLM Configuration (for query transformation & evaluation) ────────
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:4b-instruct")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
+# Optional fallback model served when the primary is unavailable.
+LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "").strip() or None
+LLM_FALLBACK_BASE_URL = os.getenv("LLM_FALLBACK_BASE_URL", LLM_BASE_URL).strip()
 
 # ── Retrieval Configuration ───────────────────────────────────────────
 DEFAULT_SEARCH_LIMIT = int(os.getenv("DEFAULT_SEARCH_LIMIT", "5"))

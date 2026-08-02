@@ -24,6 +24,20 @@ mcp = FastMCP(
 )
 
 
+def _screen_user_query(query: str) -> str | None:
+    """Return a refusal string when the query is a direct injection attempt."""
+    from guardrails.input import classify_user_input
+
+    decision = classify_user_input(query)
+    if decision.safe:
+        return None
+    return (
+        "REFUSED: this request looks like a prompt-injection attempt "
+        f"(matched: {', '.join(decision.matched_rules)}). The request is not "
+        "allowed to override the assistant's instructions, tools or grounding."
+    )
+
+
 @mcp.tool()
 def retrieve_context(
     query: str, 
@@ -43,6 +57,9 @@ def retrieve_context(
         use_reranking: Whether to use cross-encoder reranking (better quality).
         use_query_transform: Whether to decompose complex queries into sub-queries.
     """
+    blocked = _screen_user_query(query)
+    if blocked is not None:
+        return blocked
     try:
         if runtime_mode() is RuntimeMode.STANDALONE:
             from standalone_store import retrieve
@@ -194,6 +211,18 @@ def retrieve_grounded_context(
         document_ids: Restrict to specific documents.
         limit: Maximum number of passages to return.
     """
+    blocked = _screen_user_query(query)
+    if blocked is not None:
+        import json as _json
+
+        return _json.dumps(
+            {
+                "schema_name": "univai.agent.guardrail_refusal",
+                "grounded": False,
+                "reason": blocked,
+            },
+            indent=2,
+        )
     try:
         context = call_tool(
             "retrieve_context",
@@ -235,7 +264,7 @@ def create_programme_plan(
     """
     try:
         from agents.graph import run_programme
-        from agents.manager import AgentRuntime, ProgrammeRequest, ollama_llm
+        from agents.manager import AgentRuntime, ProgrammeRequest, resilient_ollama_llm
 
         result = run_programme(
             ProgrammeRequest(
@@ -246,7 +275,7 @@ def create_programme_plan(
                 capacity_hours=capacity_hours,
                 max_semesters=max_semesters,
             ),
-            AgentRuntime(llm=ollama_llm()),
+            AgentRuntime(llm=resilient_ollama_llm()),
         )
         return result.model_dump_json(indent=2)
     except Exception as e:
