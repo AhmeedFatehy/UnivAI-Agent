@@ -54,6 +54,10 @@ REFUSAL_UNCITABLE = (
     "Matching passages exist but carry no book/page identity, so they cannot be "
     "cited. Re-ingest the source material."
 )
+REFUSAL_UNSAFE_SOURCE = (
+    "Matching passages contain instruction-like source text and were excluded "
+    "from model evidence."
+)
 
 
 # ── Errors ────────────────────────────────────────────────────────────
@@ -291,7 +295,11 @@ def retrieve_context_tool(
 
     passages: list[GroundedPassage] = []
     uncitable = 0
+    unsafe = 0
     for hit in hits:
+        if hit.get("source_injection_flagged") is True:
+            unsafe += 1
+            continue
         content = (hit.get("content") or "").strip()
         if not content:
             continue
@@ -319,7 +327,12 @@ def retrieve_context_tool(
             break
 
     if not passages:
-        reason = REFUSAL_UNCITABLE if uncitable == len(hits) else REFUSAL_NO_GROUNDING
+        if unsafe == len(hits):
+            reason = REFUSAL_UNSAFE_SOURCE
+        elif uncitable + unsafe == len(hits) and uncitable:
+            reason = REFUSAL_UNCITABLE
+        else:
+            reason = REFUSAL_NO_GROUNDING
         return GroundedContext(
             query=payload.query,
             grounded=False,

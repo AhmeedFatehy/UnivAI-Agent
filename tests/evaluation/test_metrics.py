@@ -51,6 +51,11 @@ def test_context_recall_matches_the_hand_calculation():
     assert context_recall([], ["doc1"]) == 0.0
 
 
+def test_duplicate_retrieval_ids_do_not_inflate_metrics():
+    assert context_recall(["doc1"], ["doc1", "doc1"]) == 1.0
+    assert context_precision(["doc1"], ["doc1", "doc1"]) == 1.0
+
+
 def test_reciprocal_rank_matches_the_hand_calculation():
     assert reciprocal_rank(["doc3"], ["doc1", "doc2", "doc3"]) == pytest.approx(1 / 3)
     assert reciprocal_rank(["doc2", "doc4"], ["doc1", "doc2"]) == pytest.approx(1 / 2)
