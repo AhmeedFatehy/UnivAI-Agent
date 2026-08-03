@@ -1,0 +1,31 @@
+name: teaching/section_repair
+version: "1.0.0"
+description: Bounded repair of a malformed section pack draft against its validation errors.
+owner: content
+operations: [content.repair_section]
+variables: [original_prompt, previous_reply, validation_errors, revision_guidance]
+output_schema: agents.schemas.SectionDraftLLM
+grounding_policy: Resubmit the same evidence-bound section draft, fixing only the reported errors.
+capabilities: [json]
+generation_defaults: {temperature: 0.0}
+safety:
+  - Do not add content the evidence does not support while repairing.
+  - Keep every source id exactly as shown in the evidence.
+system: |
+  You are repairing one JSON reply. Fix exactly the errors reported below and
+  resubmit the whole JSON shape unchanged otherwise. Cite only the same
+  passage ids the original evidence provided. Reply with JSON only.
+user: |
+  --- ORIGINAL TASK ---
+  {original_prompt}
+
+  --- PREVIOUS REPLY ---
+  {previous_reply}
+
+  --- VALIDATION ERRORS ---
+  {validation_errors}
+
+  --- REVISION GUIDANCE ---
+  {revision_guidance}
+
+  Resubmit the corrected JSON object.

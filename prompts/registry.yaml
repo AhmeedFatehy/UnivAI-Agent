@@ -7,6 +7,8 @@ routes:
   content.generate_lecture: teaching/lecture_generation
   content.summarize_lecture: teaching/lecture_summary
   content.generate_learning_objectives: teaching/learning_objectives
+  content.generate_section: teaching/section_generation
+  content.repair_section: teaching/section_repair
   assessment.generate:quiz: assessment/quiz
   assessment.generate:diagnostic: assessment/diagnostic
   assessment.generate:practice: assessment/practice

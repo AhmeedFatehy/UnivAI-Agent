@@ -38,6 +38,10 @@ from tools.registry import GroundedContext, Refusal
 AGENT_SCHEMA = "univai.agent.graph"
 AGENT_SCHEMA_VERSION = "1.0.0"
 
+#: The grounded post-lecture section pack: the artifact UnivAI-live consumes.
+SECTION_SCHEMA = "univai.section.pack"
+SECTION_SCHEMA_VERSION = "1.0.0"
+
 #: One repair attempt, as the issue specifies. Not configurable upward by
 #: accident — a caller that wants more has to say so explicitly.
 DEFAULT_REPAIR_ATTEMPTS = 1
@@ -283,6 +287,77 @@ class AnswerExplanationLLM(BaseModel):
         return clean_passage_ids(values)
 
 
+class SectionActivityDraftLLM(BaseModel):
+    """One guided-practice activity the model proposes for the section."""
+
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    duration_minutes: int = Field(ge=1, le=120)
+    source_ids: list[str] = Field(min_length=1)
+
+    @field_validator("source_ids")
+    @classmethod
+    def _passage_ids(cls, values: list[str]) -> list[str]:
+        return clean_passage_ids(values)
+
+
+class SectionStepDraftLLM(BaseModel):
+    """One step of a worked example, each step citing its evidence."""
+
+    step: str = Field(min_length=1)
+    explanation: str = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)
+
+    @field_validator("source_ids")
+    @classmethod
+    def _passage_ids(cls, values: list[str]) -> list[str]:
+        return clean_passage_ids(values)
+
+
+class SectionExampleDraftLLM(BaseModel):
+    """A worked example: a problem solved step by step against the evidence."""
+
+    order: int = Field(ge=1)
+    prompt: str = Field(min_length=1)
+    steps: list[SectionStepDraftLLM] = Field(min_length=1)
+    conclusion: str = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)
+
+    @field_validator("source_ids")
+    @classmethod
+    def _passage_ids(cls, values: list[str]) -> list[str]:
+        return clean_passage_ids(values)
+
+
+class SectionTodoDraftLLM(BaseModel):
+    """An actionable learner TODO. Empty lists mean evidence could not support one."""
+
+    text: str = Field(min_length=1)
+    time_box_minutes: int = Field(ge=1, le=60)
+    source_ids: list[str] = Field(min_length=1)
+
+    @field_validator("source_ids")
+    @classmethod
+    def _passage_ids(cls, values: list[str]) -> list[str]:
+        return clean_passage_ids(values)
+
+
+class SectionDraftLLM(BaseModel):
+    """The unvalidated section pack as the model returns it.
+
+    ``examples`` and ``todos`` may be empty: the planner treats an empty list as
+    an explicit refusal signal when there is evidence to support nothing, and a
+    schema failure raises otherwise. This is what lets an unsupported request
+    produce a grounded refusal instead of generic teaching content.
+    """
+
+    title: str = Field(min_length=1)
+    objectives: list[str] = Field(min_length=1)
+    activities: list[SectionActivityDraftLLM] = Field(min_length=1)
+    examples: list[SectionExampleDraftLLM] = Field(default_factory=list)
+    todos: list[SectionTodoDraftLLM] = Field(default_factory=list)
+
+
 # ── Grounded results the graph returns ────────────────────────────────
 
 
@@ -323,6 +398,125 @@ class Assessment(BaseModel):
     assessment_type: AssessmentType = AssessmentType.QUIZ
     covered_scope: list[str] = Field(default_factory=list)
     questions: list[AssessmentQuestion] = Field(min_length=1)
+
+
+class SectionActivity(BaseModel):
+    """A guided-practice activity with its resolved citations."""
+
+    order: int = Field(ge=1)
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    duration_minutes: int = Field(ge=1, le=120)
+    citations: list[SourceLocation] = Field(min_length=1)
+
+
+class SectionStep(BaseModel):
+    """One worked-example step, mandatory provenance."""
+    step: str = Field(min_length=1)
+    explanation: str = Field(min_length=1)
+    citations: list[SourceLocation] = Field(min_length=1)
+
+
+class SectionExample(BaseModel):
+    """A worked example: every step and the whole carry resolved citations."""
+    order: int = Field(ge=1)
+    prompt: str = Field(min_length=1)
+    steps: list[SectionStep] = Field(min_length=1)
+    conclusion: str = Field(min_length=1)
+    citations: list[SourceLocation] = Field(min_length=1)
+
+    @property
+    def step_citations(self) -> list[SourceLocation]:
+        return [citation for step in self.steps for citation in step.citations]
+
+
+class SectionTodo(BaseModel):
+    """An actionable TODO: a concrete learner action tied to evidence."""
+    order: int = Field(ge=1)
+    text: str = Field(min_length=1)
+    time_box_minutes: int = Field(ge=1, le=60)
+    citations: list[SourceLocation] = Field(min_length=1)
+
+
+class SectionPackV1(BaseModel):
+    """The grounded post-lecture section pack artifact.
+
+    This is deliberately distinct from :class:`Lecture`: it carries
+    ``session_type="section"``, its own schema id/version, and is persisted under
+    a separate namespace so a live-delivery consumer cannot confuse a section
+    follow-up with the lecture narration.
+    """
+
+    schema_name: str = SECTION_SCHEMA
+    schema_version: str = SECTION_SCHEMA_VERSION
+    session_type: Literal["section", "lecture"] = "section"
+
+    programme_title: str = Field(min_length=1)
+    plan_schema: str = Field(min_length=1)
+    plan_version: str = Field(min_length=1)
+    user_id: str = Field(min_length=1)
+    collection_id: str = Field(min_length=1)
+    course_id: str | None = None
+    week_number: int | None = Field(default=None, ge=1)
+
+    topic_id: str = Field(min_length=1)
+    lecture_title: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    focus: str = Field(default="the material covered in the lecture")
+
+    objectives: list[str] = Field(min_length=1)
+    activities: list[SectionActivity] = Field(min_length=1)
+    examples: list[SectionExample] = Field(default_factory=list)
+    todos: list[SectionTodo] = Field(default_factory=list)
+
+    total_minutes: int = Field(ge=1)
+    passage_ids: list[str] = Field(default_factory=list)
+    created_at: str
+
+    @property
+    def citations(self) -> list[SourceLocation]:
+        seen: list[SourceLocation] = []
+        for activity in self.activities:
+            for citation in activity.citations:
+                if citation not in seen:
+                    seen.append(citation)
+        for example in self.examples:
+            for citation in [*example.citations, *example.step_citations]:
+                if citation not in seen:
+                    seen.append(citation)
+        for todo in self.todos:
+            for citation in todo.citations:
+                if citation not in seen:
+                    seen.append(citation)
+        return seen
+
+    def citation_count(self) -> int:
+        return len(self.citations)
+
+    @model_validator(mode="after")
+    def _total_minutes_are_self_consistent(self) -> "SectionPackV1":
+        expected = sum(activity.duration_minutes for activity in self.activities)
+        if self.total_minutes != expected:
+            raise ValueError(
+                f"total_minutes ({self.total_minutes}) must equal the sum of "
+                f"activity durations ({expected})"
+            )
+        return self
+
+
+class SectionOutcome(BaseModel):
+    """The result of a section request: a valid pack, or an explicit refusal."""
+
+    section: SectionPackV1 | None = None
+    refusal: Refusal | None = None
+
+    @model_validator(mode="after")
+    def _pack_xor_refusal(self) -> "SectionOutcome":
+        if self.section is not None and self.refusal is not None:
+            raise ValueError("a section outcome cannot carry both a pack and a refusal")
+        if self.section is None and self.refusal is None:
+            raise ValueError("a section outcome must carry a pack or a refusal")
+        return self
 
 
 class GraphResult(BaseModel):
@@ -585,6 +779,8 @@ def _now() -> str:
 __all__ = [
     "AGENT_SCHEMA",
     "AGENT_SCHEMA_VERSION",
+    "SECTION_SCHEMA",
+    "SECTION_SCHEMA_VERSION",
     "DEFAULT_REPAIR_ATTEMPTS",
     "AgentName",
     "AgentTrace",
@@ -604,6 +800,17 @@ __all__ = [
     "PromptTemplate",
     "PromptUseRecord",
     "RuntimeFingerprint",
+    "SectionActivity",
+    "SectionActivityDraftLLM",
+    "SectionDraftLLM",
+    "SectionExample",
+    "SectionExampleDraftLLM",
+    "SectionOutcome",
+    "SectionPackV1",
+    "SectionStep",
+    "SectionStepDraftLLM",
+    "SectionTodo",
+    "SectionTodoDraftLLM",
     "ServingRecord",
     "StructuredOutputError",
     "TaskRecord",

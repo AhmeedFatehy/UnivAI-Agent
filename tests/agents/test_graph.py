@@ -635,3 +635,130 @@ def test_prompt_rendering_leaves_the_json_example_intact():
     assert '"source_ids": ["S1"]' in rendered
     assert "Hashing" in rendered
     assert "{topic_title}" not in rendered
+
+
+# ── Post-lecture section packs ─────────────────────────────────────────
+
+
+SECTION_REPLY = json.dumps(
+    {
+        "title": "Hashing — Section Practice",
+        "objectives": ["Resolve collisions by chaining and probing."],
+        "activities": [
+            {"title": "Chain a table by hand", "description": "Bucket three keys.", "duration_minutes": 15, "source_ids": ["S1"]},
+            {"title": "Trace linear probing", "description": "Record each probe.", "duration_minutes": 20, "source_ids": ["S1"]},
+        ],
+        "examples": [
+            {
+                "order": 1,
+                "prompt": "Insert three keys into a chained table of size three.",
+                "steps": [
+                    {"step": "hash to a bucket", "explanation": "the hash chooses a bucket index", "source_ids": ["S1"]},
+                ],
+                "conclusion": "lookups stay near constant time.",
+                "source_ids": ["S1"],
+            }
+        ],
+        "todos": [
+            {"text": "Rework the probe example from memory.", "time_box_minutes": 10, "source_ids": ["S1"]},
+        ],
+    }
+)
+
+
+def test_the_content_agent_builds_a_grounded_section_for_an_approved_lecture(request_, retriever):
+    from agents.content import ContentAgent
+    from agents.schemas import AgentTrace, TaskRecord
+    from planning.section_planner import SectionIdentity
+
+    llm = ScriptedLLM(
+        {
+            "curriculum analyst": [TOPICS_JSON] * 4,
+            "lecturer": [LECTURE_JSON] * 8,
+            "assessment author": [QUIZ_JSON] * 8,
+            "Section Practice": [SECTION_REPLY] * 4,
+        }
+    )
+    runtime = AgentRuntime(llm=llm, tool_context=ToolContext(retriever=retriever))
+    result = run_programme(request_, runtime)
+    lecture = result.lectures[0]
+
+    identity = SectionIdentity(
+        programme_title=result.programme_title,
+        plan_schema=result.plan.schema_name,
+        plan_version=result.plan.schema_version,
+        user_id=result.user_id,
+        collection_id=result.collection_id,
+        course_id="CS101",
+        week_number=1,
+        topic_id=lecture.topic_id,
+        lecture_title=lecture.title,
+        created_at="2026-08-03T00:00:00+00:00",
+    )
+    trace = AgentTrace()
+    task = trace.add(
+        TaskRecord(task_id="SEC-01", agent=AgentName.CONTENT, objective="Section practice")
+    )
+
+    run = ContentAgent(runtime).generate_section_pack(task, identity=identity)
+
+    assert run.section is not None
+    assert run.section.session_type == "section"
+    assert run.section.plan_version == result.plan.schema_version
+    assert run.section.lecture_title == lecture.title
+    assert run.section.topic_id == lecture.topic_id
+    assert task.state is TaskState.SUCCEEDED
+    assert task.prompts and task.prompts[0].prompt_id == "teaching/section_generation"
+    assert all(
+        example.citations and all(step.citations for step in example.steps)
+        for example in run.section.examples
+    )
+
+
+def test_the_content_agent_refuses_a_section_the_evidence_cannot_support(request_, retriever):
+    from agents.content import ContentAgent
+    from agents.schemas import AgentTrace, TaskRecord
+    from planning.section_planner import SectionIdentity
+
+    empty = json.dumps(
+        {
+            "title": "Hashing",
+            "objectives": ["collision handling"],
+            "activities": [
+                {"title": "Open discussion", "description": "talk", "duration_minutes": 30, "source_ids": ["S1"]}
+            ],
+            "examples": [],
+            "todos": [],
+        }
+    )
+    llm = ScriptedLLM(
+        {
+            "curriculum analyst": [TOPICS_JSON] * 4,
+            "lecturer": [LECTURE_JSON] * 8,
+            "assessment author": [QUIZ_JSON] * 8,
+            "post-lecture section pack": [empty],
+        }
+    )
+    runtime = AgentRuntime(llm=llm, tool_context=ToolContext(retriever=retriever))
+    result = run_programme(request_, runtime)
+    lecture = result.lectures[0]
+    identity = SectionIdentity(
+        plan_schema="univai.programme.plan",
+        plan_version="1.0.0",
+        programme_title=result.programme_title,
+        user_id=result.user_id,
+        collection_id=result.collection_id,
+        topic_id=lecture.topic_id,
+        lecture_title=lecture.title,
+        created_at="2026-08-03T00:00:00+00:00",
+    )
+    trace = AgentTrace()
+    task = trace.add(
+        TaskRecord(task_id="SEC-02", agent=AgentName.CONTENT, objective="practice")
+    )
+
+    run = ContentAgent(runtime).generate_section_pack(task, identity=identity)
+
+    assert run.section is None
+    assert run.refusal is not None
+    assert task.state is TaskState.REFUSED
