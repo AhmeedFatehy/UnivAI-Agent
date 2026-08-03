@@ -25,6 +25,12 @@ from agents.schemas import (
 )
 from agents.prompts import PromptOperation, load_prompt_for
 from planning.programme_planner import ProgrammePlan
+from planning.learning_path import (
+    ApprovedBook,
+    LearningPathV1,
+    PrerequisiteProposal,
+    generate_learning_path,
+)
 from tools.registry import (
     CreateProgrammePlanInput,
     GroundedContext,
@@ -44,6 +50,19 @@ class CurriculumAgent:
 
     def __init__(self, runtime):
         self.runtime = runtime
+
+    @staticmethod
+    def create_learning_path(
+        books: list[ApprovedBook],
+        proposals: list[PrerequisiteProposal],
+        *,
+        collection_id: str,
+        user_id: str,
+    ) -> LearningPathV1:
+        """Validate an AI proposal and return the versioned App contract."""
+        return generate_learning_path(
+            books, proposals, collection_id=collection_id, user_id=user_id
+        )
 
     def run(self, handoff: Handoff, task: TaskRecord) -> ProgrammePlan | None:
         task.start()

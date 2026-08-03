@@ -76,3 +76,13 @@ content.
 ID has no route, a YAML file is missing or extra, two prompts claim the same
 operation, or required template variables are not supplied. Prompt changes
 use semantic versions so traces can show exactly which prompt produced output.
+
+## Cross-book learning paths
+
+`curriculum/book_prerequisite_analysis` may only propose edges supported on both
+sides by supplied excerpts. `planning/learning_path.py` validates document and
+collection provenance, topologically orders whole books, and appends each
+chapter-complete per-book plan serially. Cycles, weak/missing evidence, duplicate
+editions, overlap, ambiguous choices, and disconnected books remain visible as
+versioned warnings. The artifact stays pending (or blocked) until the App records
+approval of the exact schema version and any warning overrides.

@@ -28,6 +28,11 @@ from agents.prompts import PromptOperation, PromptTemplate, load_prompt, load_pr
 from document_processing.metadata import SourceLocation
 from planning.overlap import Topic
 from planning.programme_planner import ProgrammePlan
+from planning.learning_path import (
+    LearningPathV1,
+    PrerequisiteAnalysisDraft,
+    PrerequisiteProposal,
+)
 from telemetry.tracing import (
     RuntimeFingerprint,
     ServingRecord,
@@ -797,8 +802,11 @@ __all__ = [
     "Lecture",
     "LectureDraftLLM",
     "LectureSegment",
+    "LearningPathV1",
     "PromptTemplate",
     "PromptUseRecord",
+    "PrerequisiteAnalysisDraft",
+    "PrerequisiteProposal",
     "RuntimeFingerprint",
     "SectionActivity",
     "SectionActivityDraftLLM",
