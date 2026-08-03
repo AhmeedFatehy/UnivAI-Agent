@@ -51,7 +51,21 @@ def test_cycle_blocks_publication_and_retains_evidence_backed_alternatives():
     assert plan.approval_state is ApprovalState.BLOCKED
     assert warning.evidence and warning.alternatives
     with pytest.raises(ValueError, match="unresolved warnings"):
-        approve_learning_path(plan, schema_version="1.0.0")
+        approve_learning_path(plan, schema_version="1.0.0", plan_version=1)
+
+    approved = approve_learning_path(
+        plan,
+        schema_version="1.0.0",
+        plan_version=1,
+        warning_overrides=[warning.warning_id],
+        warning_selections={warning.warning_id: warning.alternatives[0]},
+    )
+    assert approved.approval_state is ApprovalState.APPROVED
+    assert all(
+        {book.book_id: book.position for book in approved.ordered_books}[edge.prerequisite_book_id]
+        < {book.book_id: book.position for book in approved.ordered_books}[edge.dependent_book_id]
+        for edge in approved.prerequisite_edges
+    )
 
 
 def test_low_confidence_and_ambiguous_evidence_require_human_decision():
@@ -91,6 +105,8 @@ def test_tenant_isolation_rejects_cross_collection_evidence():
 def test_exact_version_and_warning_overrides_are_required_for_approval():
     plan = generate([book("A", "Shared"), book("B", "Shared")], [])
     with pytest.raises(ValueError, match="version"):
-        approve_learning_path(plan, schema_version="2.0.0")
-    approved = approve_learning_path(plan, schema_version="1.0.0", warning_overrides=[warning.warning_id for warning in plan.warnings])
+        approve_learning_path(plan, schema_version="2.0.0", plan_version=1)
+    with pytest.raises(ValueError, match="plan version"):
+        approve_learning_path(plan, schema_version="1.0.0", plan_version=2)
+    approved = approve_learning_path(plan, schema_version="1.0.0", plan_version=1, warning_overrides=[warning.warning_id for warning in plan.warnings])
     assert approved.approval_state is ApprovalState.APPROVED
