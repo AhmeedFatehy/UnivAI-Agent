@@ -101,6 +101,7 @@ class OrderedBook(BaseModel):
 class LearningPathV1(BaseModel):
     schema_name: str = LEARNING_PATH_SCHEMA
     schema_version: str = LEARNING_PATH_VERSION
+    plan_version: int = Field(default=1, ge=1)
     collection_id: str = Field(min_length=1)
     user_id: str = Field(min_length=1)
     approved_book_ids: list[str] = Field(min_length=1)
@@ -109,6 +110,7 @@ class LearningPathV1(BaseModel):
     warnings: list[LearningPathWarning] = Field(default_factory=list)
     approval_state: ApprovalState
     approved_warning_ids: list[str] = Field(default_factory=list)
+    approved_warning_selections: dict[str, list[str]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _contract_invariants(self) -> "LearningPathV1":
@@ -143,6 +145,7 @@ def generate_learning_path(
     collection_id: str,
     user_id: str,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    plan_version: int = 1,
 ) -> LearningPathV1:
     """Validate proposals and produce a stable, reviewable serial plan."""
     if not books:
@@ -244,6 +247,7 @@ def generate_learning_path(
         global_week += week_plan.week_count
 
     return LearningPathV1(
+        plan_version=plan_version,
         collection_id=collection_id, user_id=user_id,
         approved_book_ids=[book.book_id for book in books], ordered_books=ordered,
         prerequisite_edges=edges, warnings=warnings,
@@ -251,15 +255,61 @@ def generate_learning_path(
     )
 
 
-def approve_learning_path(plan: LearningPathV1, *, schema_version: str, warning_overrides: list[str] | None = None) -> LearningPathV1:
+def approve_learning_path(
+    plan: LearningPathV1,
+    *,
+    schema_version: str,
+    plan_version: int,
+    warning_overrides: list[str] | None = None,
+    warning_selections: dict[str, list[str]] | None = None,
+) -> LearningPathV1:
     """Record exact-plan approval; callers must name its version and warnings."""
     if schema_version != plan.schema_version:
         raise ValueError("approval schema version does not match the exact plan")
+    if plan_version != plan.plan_version:
+        raise ValueError("approval plan version does not match the exact plan")
     overrides = sorted(set(warning_overrides or []))
+    selections = warning_selections or {}
     required = {warning.warning_id for warning in plan.warnings if warning.blocks_approval}
     if not required.issubset(overrides):
         raise ValueError(f"unresolved warnings: {sorted(required - set(overrides))}")
-    return plan.model_copy(update={"approval_state": ApprovalState.APPROVED, "approved_warning_ids": overrides})
+
+    ordered_books = plan.ordered_books
+    prerequisite_edges = plan.prerequisite_edges
+    for warning in plan.warnings:
+        if warning.kind != "cycle":
+            continue
+        selected = selections.get(warning.warning_id)
+        if selected not in warning.alternatives:
+            raise ValueError(f"cycle warning {warning.warning_id} requires an explicit listed ordering")
+        rank = {book_id: index for index, book_id in enumerate(selected)}
+        if set(rank) != set(plan.approved_book_ids):
+            raise ValueError("cycle resolution must order every approved book exactly once")
+        prerequisite_edges = [
+            edge for edge in prerequisite_edges
+            if rank[edge.prerequisite_book_id] < rank[edge.dependent_book_id]
+        ]
+        by_id = {book.book_id: book for book in ordered_books}
+        rebuilt: list[OrderedBook] = []
+        global_week = 1
+        for position, book_id in enumerate(selected, start=1):
+            book = by_id[book_id]
+            week_count = book.week_plan.week_count
+            rebuilt.append(book.model_copy(update={
+                "position": position,
+                "starts_at_global_week": global_week,
+                "ends_at_global_week": global_week + week_count - 1,
+            }))
+            global_week += week_count
+        ordered_books = rebuilt
+
+    return plan.model_copy(update={
+        "ordered_books": ordered_books,
+        "prerequisite_edges": prerequisite_edges,
+        "approval_state": ApprovalState.APPROVED,
+        "approved_warning_ids": overrides,
+        "approved_warning_selections": selections,
+    })
 
 
 def _warning(index: int, kind: str, ids: list[str], message: str, proposal: PrerequisiteProposal | None = None) -> LearningPathWarning:
