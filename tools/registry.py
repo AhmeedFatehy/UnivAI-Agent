@@ -26,9 +26,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from cache.authorization import GrantDenied, GrantStore
 from document_processing.batch_ingestion import (
+    ArtifactCache,
     BatchIngestionReport,
     IngestionBackend,
+    default_artifact_cache,
 )
 from document_processing.batch_ingestion import ingest_collection as _run_ingest_collection
 from document_processing.metadata import SourceLocation, citation_from_payload
@@ -46,6 +49,10 @@ TOOL_SCHEMA_VERSION = "1.0.0"
 DEFAULT_MIN_TERM_COVERAGE = 0.34
 
 REFUSAL_NO_HITS = "The indexed material contains nothing matching this question."
+REFUSAL_NO_GRANT = (
+    "You are not authorized to retrieve this document. The upload or grant for "
+    "this book does not belong to this account."
+)
 REFUSAL_NO_GROUNDING = (
     "Retrieved passages do not actually cover this question, so there is no "
     "evidence to cite."
@@ -232,14 +239,33 @@ def _default_locator(*, user_id: str, document_id: str, chunk_index: int | None)
 
 @dataclass
 class ToolContext:
-    """Injectable side effects. Defaults are the real Qdrant-backed pipeline."""
+    """Injectable side effects. Defaults are the real Qdrant-backed pipeline.
+
+    ``authorization`` gates retrieval and citation resolution on active tenant
+    grants; ``cache`` makes ingestion content-addressed so identical bytes are
+    parsed, chunked and embedded once. A context using the real default I/O is
+    configured securely from the shared on-disk cache. Tests that inject their
+    own retriever/locator remain isolated unless they explicitly inject grants.
+    """
 
     retriever: Callable[..., list[dict]] = field(default=None)  # type: ignore[assignment]
     locator: Callable[..., list[dict]] = field(default=None)  # type: ignore[assignment]
     ingestion_backend: IngestionBackend | None = None
     collection_name: str | None = None
+    authorization: GrantStore | None = None
+    cache: ArtifactCache | None = None
 
     def __post_init__(self) -> None:
+        uses_default_io = (
+            self.retriever is None
+            and self.locator is None
+            and self.ingestion_backend is None
+        )
+        if self.cache is not None and self.authorization is None:
+            self.authorization = self.cache.grants
+        elif self.cache is None and self.authorization is None and uses_default_io:
+            self.cache = default_artifact_cache()
+            self.authorization = self.cache.grants
         if self.retriever is None:
             self.retriever = _default_retriever
         if self.locator is None:
@@ -259,6 +285,7 @@ def ingest_collection_tool(
         backend=context.ingestion_backend,
         collection_name=payload.collection_name or context.collection_name,
         max_attempts=payload.max_attempts,
+        cache=context.cache,
     )
     return report
 
@@ -266,13 +293,58 @@ def ingest_collection_tool(
 def retrieve_context_tool(
     payload: RetrieveContextInput, context: ToolContext
 ) -> GroundedContext:
-    """Retrieve, then decide whether what came back is actually evidence."""
+    """Retrieve, then decide whether what came back is actually evidence.
+
+    When an authorization store is configured, every requested document must
+    carry an active grant for this tenant; an un-granted document is an
+    explicit refusal, and the search itself is further narrowed by the grant
+    filter so un-authorised chunks can never reach the model.
+    """
     scope: dict[str, Any] = {
         "user_id": payload.user_id,
         "collection_id": payload.collection_id,
         "document_ids": payload.document_ids,
         "book_titles": payload.book_titles,
     }
+
+    grant_filter: Callable[..., list[str]] | None = None
+    authorized_document_ids = list(payload.document_ids)
+    if context.authorization is not None:
+        for document_id in authorized_document_ids:
+            if not context.authorization.is_granted(payload.user_id, document_id):
+                return GroundedContext(
+                    query=payload.query,
+                    grounded=False,
+                    refusal=Refusal(
+                        reason=REFUSAL_NO_GRANT,
+                        query=payload.query,
+                        scope={**scope, "document_ids": [document_id]},
+                    ),
+                )
+
+        if not authorized_document_ids:
+            authorized_document_ids = context.authorization.authorized_document_ids(
+                payload.user_id,
+                collection_id=payload.collection_id,
+                book_titles=payload.book_titles,
+            )
+            if not authorized_document_ids:
+                return GroundedContext(
+                    query=payload.query,
+                    grounded=False,
+                    refusal=Refusal(
+                        reason=REFUSAL_NO_GRANT,
+                        query=payload.query,
+                        scope=scope,
+                    ),
+                )
+
+        def grant_filter(document_ids: list[str]) -> list[str]:
+            return [
+                document_id
+                for document_id in document_ids
+                if context.authorization.is_granted(payload.user_id, document_id)
+            ]
 
     hits = context.retriever(
         query=payload.query,
@@ -282,8 +354,9 @@ def retrieve_context_tool(
         use_query_transform=payload.use_query_transform,
         collection_name=context.collection_name,
         collection_id=payload.collection_id,
-        document_ids=payload.document_ids or None,
+        document_ids=authorized_document_ids or None,
         book_titles=payload.book_titles or None,
+        grant_filter=grant_filter,
     )
 
     if not hits:
@@ -363,6 +436,12 @@ def get_source_location_tool(
     payload: GetSourceLocationInput, context: ToolContext
 ) -> SourceLocationResult:
     """Resolve a citation back to the exact passage it claims to come from."""
+    if context.authorization is not None:
+        try:
+            context.authorization.require_grant(payload.user_id, payload.document_id)
+        except GrantDenied as error:
+            return SourceLocationResult(found=False, reason=str(error))
+
     rows = context.locator(
         user_id=payload.user_id,
         document_id=payload.document_id,
@@ -545,6 +624,7 @@ def tool_manifest() -> list[dict]:
 
 __all__ = [
     "DEFAULT_MIN_TERM_COVERAGE",
+    "REFUSAL_NO_GRANT",
     "REFUSAL_NO_GROUNDING",
     "REFUSAL_NO_HITS",
     "REFUSAL_UNCITABLE",

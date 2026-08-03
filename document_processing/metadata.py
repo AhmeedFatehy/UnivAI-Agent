@@ -168,6 +168,48 @@ def stable_document_id(collection_id: str, source_filename: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
 
+class ReusableChunk:
+    """A minimal chunk-like object rebuilt from a cached artifact.
+
+    The content-addressed cache stores parsed, chunked text so identical bytes
+    are not parsed twice. Before tenant identity is stamped on, the stored
+    chunks are rebuilt into this small stand-in — it carries the two things
+    ``apply_chunk_metadata`` needs (``page_content`` and a mutable
+    ``metadata`` dict) and nothing else.
+    """
+
+    __slots__ = ("page_content", "metadata")
+
+    def __init__(self, page_content: str, metadata: dict | None = None):
+        self.page_content = page_content
+        self.metadata = metadata or {}
+
+
+def rebuild_chunks(
+    texts: list[str],
+    *,
+    pages: list[int | None] | None = None,
+) -> list[ReusableChunk]:
+    """Rebuild chunks from a cached artifact's stored texts.
+
+    ``pages`` carries the loader page for each chunk; ``None`` means the loader
+    had no page for that chunk, so the 1-based ordinal stands in and is flagged
+    as estimated by :func:`apply_chunk_metadata` — exactly as in a fresh
+    chunking run, never silently invented.
+    """
+    texts = list(texts)
+    total = len(texts)
+    pages = pages or [None] * total
+    chunks: list[ReusableChunk] = []
+    for index, text in enumerate(texts):
+        metadata: dict = {"chunk_index": index, "total_chunks": total}
+        page = pages[index] if index < len(pages) else None
+        if page is not None:
+            metadata["page"] = page
+        chunks.append(ReusableChunk(text, metadata))
+    return chunks
+
+
 def normalise_page(raw: object) -> int | None:
     """Coerce a loader page value to a 1-based page number.
 
@@ -382,6 +424,7 @@ __all__ = [
     "PAYLOAD_SOURCE_FILENAME",
     "PAYLOAD_USER_ID",
     "ChunkMetadata",
+    "ReusableChunk",
     "SourceLocation",
     "apply_chunk_metadata",
     "assign_sections",
@@ -389,5 +432,6 @@ __all__ = [
     "citation_from_payload",
     "headings_in",
     "normalise_page",
+    "rebuild_chunks",
     "stable_document_id",
 ]

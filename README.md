@@ -70,6 +70,7 @@ services are missing and never falls back to fixtures.
 | `mcp_server.py` | the MCP entry point the other services call |
 | `generation/` | course generation: `lecture_gen.py` turns the indexed book into slides + narration + quiz JSON per week (Brain makes JSON, the other caves eat it) |
 | `document_processing/` | parsing + chunking |
+| `cache/` | content-addressed artifact cache + tenant authorization |
 | `vector_store/` | embedding + Qdrant indexing |
 | `retrieval/` | search + reranking |
 | `evaluation/` | retrieval quality experiments |
@@ -87,6 +88,28 @@ services are missing and never falls back to fixtures.
 validation used by the smoke command. Standalone ingest accepts only
 project-authored text/Markdown beneath `fixtures/` or the configured
 `.standalone/uploads/` directory. Reset refuses paths outside this repository.
+
+### Content-addressed RAG cache
+
+Identical bytes are parsed, chunked and embedded exactly once per pipeline
+version, then safely reused by every tenant that uploads them:
+
+- `cache/content_identity.py` hashes the raw file bytes (SHA-256) and
+  fingerprints the whole pipeline (parsers, splitter, chunk size/overlap,
+  embedding models, metadata schema, document type).
+- `cache/artifact_registry.py` stores one immutable artifact per
+  `content_hash:fingerprint` key with an atomic `building → ready | failed |
+  corrupt` state machine, one-writer builds across concurrent uploads, and
+  re-verification of byte length + hash before any reuse. It is backed by
+  `.cache/artifacts/` (override with `UNIVAI_ARTIFACT_CACHE_ROOT`).
+- `cache/authorization.py` gives every tenant an independent, revocable grant
+  on a shared artifact. Retrieval and citation resolution refuse any document
+  without an active grant (`REFUSAL_NO_GRANT`), and deleting the last reference
+  removes the artifact.
+
+The cache never stores filenames, tenant identity or raw book text; telemetry
+is an append-only `events.jsonl` carrying only keys, fingerprints, sizes and
+outcomes.
 
 Real model/provider testing is opt-in through integrated mode. Model downloads,
 Qdrant failures, and Ollama failures therefore cannot be mistaken for
