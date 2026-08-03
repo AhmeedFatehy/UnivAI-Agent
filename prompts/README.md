@@ -50,6 +50,18 @@ Every assessment receives a covered scope, question count, difficulty mix,
 allowed formats, and grounded evidence. Every returned assessment records its
 type and rejects a reply that claims to be a different type.
 
+## Post-lecture section packs
+
+`teaching/section_generation` (`content.generate_section`) drafts a section for a
+live follow-up: ordered activities, worked examples and explicit learner TODOs,
+each forced to cite supplied evidence. `teaching/section_repair`
+(`content.repair_section`) is the bounded repair prompt used when that draft is
+malformed. `planning/section_planner.py` enforces the deterministic invariants:
+every source id resolves against the evidence, the total activity duration stays
+inside the configured budget, and objectives are non-empty and distinct. A pack
+that the evidence cannot support is refused, never padded with generic teaching
+content.
+
 ## Adding or changing a prompt
 
 1. Add one stable ID to `PromptId` and one caller-facing operation to

@@ -14,16 +14,25 @@ from agents.schemas import (
     Lecture,
     LectureDraftLLM,
     LectureSegment,
+    PromptUseRecord,
     ServingRecord,
     StructuredOutputError,
     TaskRecord,
     ToolCallRecord,
     UngroundedCitation,
     generate_structured,
-    PromptUseRecord,
     resolve_citations,
 )
 from agents.prompts import PromptOperation, load_prompt_for
+from planning.section_planner import (
+    DEFAULT_SECTION_BUDGET,
+    SectionBudget,
+    SectionIdentity,
+)
+from generation.section_gen import (
+    SectionRun,
+    generate_section_pack,
+)
 from tools.registry import GroundedContext, RetrieveContextInput, call_tool
 
 DEFAULT_SLIDE_COUNT = 4
@@ -123,5 +132,47 @@ class ContentAgent:
         task.succeed()
         return lecture
 
+    def generate_section_pack(
+        self,
+        task: TaskRecord,
+        *,
+        identity: SectionIdentity,
+        focus: str = "the material covered in the lecture",
+        budget: SectionBudget = DEFAULT_SECTION_BUDGET,
+        evidence_limit: int = DEFAULT_EVIDENCE_LIMIT,
+    ) -> SectionRun:
+        """Generate a grounded section pack for an approved lecture, or refuse.
 
-__all__ = ["DEFAULT_EVIDENCE_LIMIT", "DEFAULT_SLIDE_COUNT", "ContentAgent"]
+        A section is the content agent's own capability: it reuses the same
+        grounded retrieval and repair discipline as the lecture, and records its
+        prompt id/version and served calls on the task trace so the section's
+        provenance is visible next to the lecture's.
+        """
+        task.start()
+        run = generate_section_pack(
+            llm=self.runtime.llm,
+            identity=identity,
+            tool_context=self.runtime.tool_context,
+            focus=focus,
+            budget=budget,
+            on_call=lambda: setattr(task, "llm_calls", task.llm_calls + 1),
+        )
+        task.prompts.append(
+            PromptUseRecord(
+                operation=PromptOperation.CONTENT_GENERATE_SECTION.value,
+                prompt_id=run.prompt_id,
+                version=run.prompt_version,
+            )
+        )
+        if run.section is not None:
+            task.succeed()
+        elif run.refusal is not None:
+            task.refuse(run.refusal)
+        return run
+
+
+__all__ = [
+    "DEFAULT_EVIDENCE_LIMIT",
+    "DEFAULT_SLIDE_COUNT",
+    "ContentAgent",
+]
