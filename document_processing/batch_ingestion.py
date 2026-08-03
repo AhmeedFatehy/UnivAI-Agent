@@ -50,6 +50,7 @@ from document_processing.metadata import (
     ChunkMetadata,
     apply_chunk_metadata,
     book_title_from,
+    book_title_from_content,
     normalise_page,
     rebuild_chunks,
     stable_document_id,
@@ -339,7 +340,7 @@ def _prepare_ingestion(
             or source.suffix.lstrip(".")
             or "unknown"
         )
-        book_title = book_title_from(documents, source)
+        book_title = book_title_from_content(documents)
         chunks = backend.chunk(documents, document_type)
         texts = [getattr(chunk, "page_content", "") or "" for chunk in chunks]
         dense, sparse = backend.embed(texts)
@@ -388,7 +389,7 @@ def _prepare_ingestion(
     chunks = rebuild_chunks(artifact.chunk_texts, pages=artifact.pages)
     return (
         chunks,
-        artifact.book_title,
+        artifact.book_title or book_title_from([], source),
         artifact.document_type,
         {
             "outcome": outcome,

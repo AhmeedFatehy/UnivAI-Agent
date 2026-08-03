@@ -81,7 +81,9 @@ class ContentArtifact(BaseModel):
     byte_size: int = Field(ge=0)
     pipeline_fingerprint: str = Field(min_length=1)
     document_type: str = Field(min_length=1)
-    book_title: str = Field(min_length=1)
+    # Only a title extracted from the immutable bytes belongs here. A
+    # filename-derived title is tenant metadata and must stay on the grant.
+    book_title: str | None = None
     chunks: list[ArtifactChunk] = Field(default_factory=list)
     state: ArtifactState = ArtifactState.BUILDING
     build_id: str = ""
@@ -137,6 +139,16 @@ class _FileLock:
                 self._held = True
                 return
             except FileExistsError:
+                # An abruptly terminated process cannot remove its lock file.
+                # Registry critical sections are tiny, so a lock older than a
+                # conservative floor is abandoned and may be recovered.
+                try:
+                    stale_after = max(30.0, self.timeout_seconds * 2)
+                    if time.time() - self.path.stat().st_mtime > stale_after:
+                        os.unlink(self.path)
+                        continue
+                except FileNotFoundError:
+                    continue
                 if time.monotonic() >= deadline:
                     raise ArtifactBuildTimeout(
                         f"timed out waiting for registry lock {self.path}"
@@ -310,6 +322,7 @@ class ArtifactRegistry:
 
             if current == ArtifactState.BUILDING.value:
                 if self._is_stale(record):
+                    previous_builder = record.get("builder_id")
                     record["build_id"] = str(uuid.uuid4())
                     record["builder_id"] = builder_id
                     record["claimed_at"] = now
@@ -319,7 +332,7 @@ class ArtifactRegistry:
                         "cache_build_recovered",
                         artifact_key=artifact_key,
                         builder_id=builder_id,
-                        previous_builder=record.get("builder_id"),
+                        previous_builder=previous_builder,
                     )
                     return BuildClaim.RECOVERED
                 return BuildClaim.WAIT
@@ -448,6 +461,17 @@ class ArtifactRegistry:
             if payload is None or payload.artifact_key != artifact_key:
                 self._mark_corrupt_locked(
                     state, record, artifact_key, "artifact payload missing or mismatched"
+                )
+                return None
+            if (
+                payload.content_hash != content_hash
+                or payload.byte_size != byte_size
+                or payload.content_hash != record.get("content_hash")
+                or payload.byte_size != record.get("byte_size")
+                or payload.pipeline_fingerprint != record.get("pipeline_fingerprint")
+            ):
+                self._mark_corrupt_locked(
+                    state, record, artifact_key, "artifact payload identity mismatch"
                 )
                 return None
             if payload.chunk_count == 0:

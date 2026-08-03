@@ -434,6 +434,27 @@ def test_identical_bytes_build_once_and_hit_for_every_tenant(book_paths, fake_in
     assert per_owner["student-a"] == per_owner["student-b"]
 
 
+def test_cache_hit_never_reuses_another_tenants_filename_as_title(fake_index, tmp_path):
+    first = tmp_path / "private-name.md"
+    second = tmp_path / "different-name.md"
+    first.write_text("Plain content without a document title.", encoding="utf-8")
+    second.write_bytes(first.read_bytes())
+    cache = ArtifactCache.at(tmp_path / "cache")
+    counter: dict[str, int] = {}
+    backend = _embedding_backend(fake_index, counter)
+
+    first_report, _ = ingest_collection(
+        [first], collection_id=COLLECTION_ID, user_id="student-a", backend=backend, cache=cache
+    )
+    second_report, _ = ingest_collection(
+        [second], collection_id=COLLECTION_ID, user_id="student-b", backend=backend, cache=cache
+    )
+
+    assert counter["calls"] == 1
+    assert first_report.succeeded[0].book_title == "private name"
+    assert second_report.succeeded[0].book_title == "different name"
+
+
 def test_reingesting_by_the_same_tenant_reuses_the_artifact(book_paths, fake_index, tmp_path):
     cache = ArtifactCache.at(tmp_path / "cache")
     counter: dict[str, int] = {}

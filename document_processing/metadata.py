@@ -276,22 +276,28 @@ def _leading_heading(text: str) -> str | None:
     return None
 
 
-def book_title_from(documents: list, path: Path | str) -> str:
-    """Best available title for a book: metadata title, first H1, then filename."""
-    source = Path(path)
-    for document in documents or []:
-        metadata = getattr(document, "metadata", None) or {}
-        for key in ("title", "book_title", "Title"):
-            candidate = metadata.get(key)
-            if isinstance(candidate, str) and clean_heading(candidate):
-                return clean_heading(candidate)
+def book_title_from_content(documents: list) -> str | None:
+    """Return a heading carried by the immutable document bytes, if present.
 
+    Loader metadata is intentionally excluded: several loaders populate its
+    title field from the uploader's local filename.
+    """
     if documents:
         head = _FRONT_MATTER_RE.sub("", getattr(documents[0], "page_content", "") or "")
         found = headings_in(head)
         if found:
             return found[0]
 
+    return None
+
+
+def book_title_from(documents: list, path: Path | str) -> str:
+    """Best available title for a book: content title, then this tenant's filename."""
+    content_title = book_title_from_content(documents)
+    if content_title:
+        return content_title
+
+    source = Path(path)
     return source.stem.replace("_", " ").replace("-", " ").strip() or source.name
 
 
@@ -429,6 +435,7 @@ __all__ = [
     "apply_chunk_metadata",
     "assign_sections",
     "book_title_from",
+    "book_title_from_content",
     "citation_from_payload",
     "headings_in",
     "normalise_page",
