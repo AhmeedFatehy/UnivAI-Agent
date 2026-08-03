@@ -9,6 +9,7 @@ These tests pin exactly that.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -249,6 +250,28 @@ def test_a_hash_mismatch_marks_the_artifact_corrupt(tmp_path):
     )
     assert registry.verify_reusable(KEY, content_hash="ff" * 32, byte_size=6) is None
     assert registry.record(KEY)["state"] == ArtifactState.CORRUPT.value
+
+
+def test_tampered_payload_identity_is_rejected(tmp_path):
+    registry = _registry(tmp_path)
+    registry.ensure_ready(
+        KEY, content_hash=KEY_HASH, byte_size=6, build=lambda: _artifact()
+    )
+    payload = json.loads(registry.payload_path(KEY).read_text(encoding="utf-8"))
+    payload["content_hash"] = "ff" * 32
+    registry.payload_path(KEY).write_text(json.dumps(payload), encoding="utf-8")
+
+    assert registry.verify_reusable(KEY, content_hash=KEY_HASH, byte_size=6) is None
+    assert registry.record(KEY)["state"] == ArtifactState.CORRUPT.value
+
+
+def test_abandoned_registry_lock_is_recovered(tmp_path):
+    registry = _registry(tmp_path, lock_timeout_seconds=0.05)
+    registry.lock_file.write_text("abandoned", encoding="utf-8")
+    old = time.time() - 60
+    os.utime(registry.lock_file, (old, old))
+
+    assert registry.claim_build(KEY) is BuildClaim.CLAIMED
 
 
 def test_a_corrupt_artifact_is_rebuilt_not_reused(tmp_path):
