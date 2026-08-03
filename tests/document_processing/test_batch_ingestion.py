@@ -11,7 +11,9 @@ from pathlib import Path
 import pytest
 
 from document_processing.batch_ingestion import (
+    ArtifactCache,
     IngestionBackend,
+    IngestionError,
     ingest_collection,
     ingest_document,
 )
@@ -25,6 +27,7 @@ from document_processing.metadata import (
     normalise_page,
     stable_document_id,
 )
+from cache.content_identity import ContentIdentity, default_pipeline_components
 from tests.conftest import COLLECTION_ID, USER_ID, markdown_loader
 
 
@@ -363,6 +366,200 @@ def test_a_permanent_failure_is_not_retried(book_paths, fake_index):
     assert loader.calls == 1, "retrying an unsupported format only wastes time"
     assert report.failed[0].attempts == 1
     assert report.failed[0].retryable is False
+
+
+# ── Content-addressed cache and tenant grants ─────────────────────────
+
+
+class FakeVector:
+    """Stand-in for a dense embedding with ``tolist()``."""
+
+    def __init__(self, data: list[float]):
+        self._data = data
+
+    def tolist(self) -> list[float]:
+        return list(self._data)
+
+
+class FakeSparse:
+    """Stand-in for a sparse embedding exposing ``indices``/``values``."""
+
+    def __init__(self, indices: list[int], values: list[float]):
+        self.indices = FakeVector(indices)
+        self.values = FakeVector(values)
+
+
+def _embedding_backend(fake_index, counter: dict | None = None) -> IngestionBackend:
+    def embed(texts: list[str]):
+        if counter is not None:
+            counter["calls"] = counter.get("calls", 0) + 1
+        dense = [FakeVector([1.0 + 0.1 * index, 0.2, 0.3]) for index in range(len(texts))]
+        sparse = [FakeSparse([0, 1], [0.5, 0.5]) for _ in texts]
+        return dense, sparse
+
+    return IngestionBackend(
+        load=markdown_loader,
+        chunk=chunk_documents,
+        index=fake_index.index,
+        purge=fake_index.purge,
+        embed=embed,
+    )
+
+
+def test_identical_bytes_build_once_and_hit_for_every_tenant(book_paths, fake_index, tmp_path):
+    cache = ArtifactCache.at(tmp_path / "cache")
+    counter: dict[str, int] = {}
+    backend = _embedding_backend(fake_index, counter)
+
+    for user in ("student-a", "student-b"):
+        report, _ = ingest_collection(
+            book_paths[:1],
+            collection_id=COLLECTION_ID,
+            user_id=user,
+            backend=backend,
+            cache=cache,
+        )
+        assert report.complete_success, report.failed
+
+    assert counter["calls"] == 1, "identical bytes must be embedded exactly once"
+    events = cache.registry.events()
+    assert sum(1 for event in events if event["event"] == "cache_build_started") == 1
+    assert sum(1 for event in events if event["event"] == "cache_hit") == 1
+
+    owners = {row["user_id"] for row in fake_index.rows}
+    assert owners == {"student-a", "student-b"}
+    per_owner = {
+        owner: sum(1 for row in fake_index.rows if row["user_id"] == owner) for owner in owners
+    }
+    assert per_owner["student-a"] == per_owner["student-b"]
+
+
+def test_reingesting_by_the_same_tenant_reuses_the_artifact(book_paths, fake_index, tmp_path):
+    cache = ArtifactCache.at(tmp_path / "cache")
+    counter: dict[str, int] = {}
+    backend = _embedding_backend(fake_index, counter)
+
+    for _ in range(2):
+        report, _ = ingest_collection(
+            book_paths[:1],
+            collection_id=COLLECTION_ID,
+            user_id=USER_ID,
+            backend=backend,
+            cache=cache,
+        )
+        assert report.complete_success, report.failed
+
+    assert counter["calls"] == 1
+    events = cache.registry.events()
+    assert sum(1 for event in events if event["event"] == "cache_build_started") == 1
+    keys = [(row["document_id"], row["chunk_index"]) for row in fake_index.rows]
+    assert len(keys) == len(set(keys)), "re-ingestion must replace, not duplicate"
+
+
+def test_each_tenant_keeps_an_independent_revocable_grant(book_paths, fake_index, tmp_path):
+    cache = ArtifactCache.at(tmp_path / "cache")
+    backend = _embedding_backend(fake_index)
+    document_id = stable_document_id(COLLECTION_ID, book_paths[0].name)
+    identity = ContentIdentity.from_file(book_paths[0], pipeline=default_pipeline_components())
+
+    for user in ("student-a", "student-b"):
+        ingest_collection(
+            book_paths[:1],
+            collection_id=COLLECTION_ID,
+            user_id=user,
+            backend=backend,
+            cache=cache,
+        )
+
+    assert cache.grants.active_refcount(identity.artifact_key) == 2
+    assert cache.is_granted("student-a", document_id) is True
+    assert cache.is_granted("student-b", document_id) is True
+
+    cache.revoke("student-a", document_id)
+    assert cache.is_granted("student-a", document_id) is False
+    assert cache.is_granted("student-b", document_id) is True
+    assert cache.grants.active_refcount(identity.artifact_key) == 1
+    assert cache.registry.get(identity.artifact_key) is not None, "B still needs the artifact"
+
+    cache.revoke("student-b", document_id)
+    assert cache.registry.get(identity.artifact_key) is None, "last revoke must clean up"
+
+
+def test_different_bytes_get_different_artifacts(book_paths, fake_index, tmp_path):
+    cache = ArtifactCache.at(tmp_path / "cache")
+    backend = _embedding_backend(fake_index)
+
+    for book in book_paths:
+        report, _ = ingest_collection(
+            [book], collection_id=COLLECTION_ID, user_id=USER_ID, backend=backend, cache=cache
+        )
+        assert report.complete_success, report.failed
+
+    built = [
+        event["artifact_key"]
+        for event in cache.registry.events()
+        if event["event"] == "cache_build_started"
+    ]
+    assert len(built) == 3
+    assert len(set(built)) == 3, "different bytes must not share an artifact"
+
+
+def test_a_changed_pipeline_invalidates_the_cache(book_paths, fake_index, tmp_path, monkeypatch):
+    import config
+
+    cache = ArtifactCache.at(tmp_path / "cache")
+    backend = _embedding_backend(fake_index)
+    document_id = stable_document_id(COLLECTION_ID, book_paths[0].name)
+    first_identity = ContentIdentity.from_file(
+        book_paths[0], pipeline=default_pipeline_components()
+    )
+
+    ingest_collection(
+        book_paths[:1], collection_id=COLLECTION_ID, user_id=USER_ID, backend=backend, cache=cache
+    )
+    monkeypatch.setattr(config, "CHUNK_SIZE", 999)
+    second_identity = ContentIdentity.from_file(
+        book_paths[0], pipeline=default_pipeline_components()
+    )
+    ingest_collection(
+        book_paths[:1], collection_id=COLLECTION_ID, user_id=USER_ID, backend=backend, cache=cache
+    )
+
+    assert first_identity.artifact_key != second_identity.artifact_key
+    assert cache.grants.require_grant(USER_ID, document_id).artifact_key == (
+        second_identity.artifact_key
+    )
+    assert cache.registry.get(first_identity.artifact_key) is None
+    assert cache.registry.get(second_identity.artifact_key) is not None
+    events = cache.registry.events()
+    assert sum(1 for event in events if event["event"] == "cache_build_started") == 2
+    assert sum(1 for event in events if event["event"] == "cache_hit") == 0
+
+
+def test_a_grant_is_only_created_after_the_index_succeeds(book_paths, fake_index, tmp_path):
+    cache = ArtifactCache.at(tmp_path / "cache")
+    backend = _embedding_backend(fake_index)
+    document_id = stable_document_id(COLLECTION_ID, book_paths[0].name)
+
+    def fail_index(**kwargs):
+        raise ConnectionError("qdrant connection reset")
+
+    backend.index = fail_index
+
+    with pytest.raises(IngestionError):
+        ingest_document(
+            book_paths[0],
+            collection_id=COLLECTION_ID,
+            user_id=USER_ID,
+            backend=backend,
+            cache=cache,
+            max_attempts=1,
+        )
+
+    assert cache.is_granted(USER_ID, document_id) is False
+    assert cache.grants.active_refcount(
+        ContentIdentity.from_file(book_paths[0], pipeline=default_pipeline_components()).artifact_key
+    ) == 0
 
 
 # ── Metadata units ────────────────────────────────────────────────────

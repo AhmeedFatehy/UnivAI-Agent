@@ -2,12 +2,14 @@
 
 This is the main entry point for retrieval. It chains:
   1. (Optional) Query transformation → multiple sub-queries
-  2. Hybrid search (dense + sparse + RRF) per sub-query
-  3. Merge & deduplicate results
-  4. (Optional) Cross-encoder reranking
-  5. Format results with citations
+  2. Grant check → only documents the tenant is authorized for are searched
+  3. Hybrid search (dense + sparse + RRF) per sub-query
+  4. Merge & deduplicate results
+  5. (Optional) Cross-encoder reranking
+  6. Format results with citations
 """
 import logging
+from collections.abc import Callable
 
 from config import DEFAULT_SEARCH_LIMIT
 from document_processing.metadata import (
@@ -33,6 +35,7 @@ def retrieve(
     collection_id: str | None = None,
     document_ids: list[str] | None = None,
     book_titles: list[str] | None = None,
+    grant_filter: Callable[[list[str]], list[str]] | None = None,
 ) -> list[dict]:
     """Full retrieval pipeline with all advanced features.
 
@@ -47,11 +50,25 @@ def retrieve(
         collection_id: Restrict to one logical multi-book collection.
         document_ids: Restrict to specific documents (source isolation).
         book_titles: Restrict to specific books by title.
+        grant_filter: Optional callback that reduces ``document_ids`` to the
+            ones the tenant holds an active grant for. Documents without a
+            grant are never searched, so an upload the tenant never received is
+            unreachable.
 
     Returns:
         List of document dicts with content, scores, and citation info.
     """
     limit = limit or DEFAULT_SEARCH_LIMIT
+
+    if document_ids and grant_filter is not None:
+        allowed = grant_filter(document_ids)
+        if not allowed:
+            logger.info(
+                "Tenant '%s' holds no active grant for any requested document", user_id
+            )
+            return []
+        document_ids = allowed
+
     filter_variants = build_source_filters(
         filters,
         collection_id=collection_id,
@@ -191,6 +208,7 @@ def retrieve_formatted(
     collection_id: str | None = None,
     document_ids: list[str] | None = None,
     book_titles: list[str] | None = None,
+    grant_filter: Callable[[list[str]], list[str]] | None = None,
 ) -> str:
     """Retrieve and format results as a string for LLM consumption.
 
@@ -207,6 +225,7 @@ def retrieve_formatted(
         collection_id=collection_id,
         document_ids=document_ids,
         book_titles=book_titles,
+        grant_filter=grant_filter,
     )
 
     if not docs:

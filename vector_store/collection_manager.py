@@ -231,13 +231,30 @@ def delete_document(
     user_id: str,
     document_id: str,
     collection_name: str | None = None,
+    *,
+    grants: "GrantStore | None" = None,
+    registry: "ArtifactRegistry | None" = None,
 ) -> int:
     """Delete all chunks belonging to a specific document for a user.
+
+    When ``grants`` and ``registry`` are given, the tenant's grant is revoked
+    and the shared content-addressed artifact is cleaned up once the final
+    reference is gone — removing tenant A's book never touches tenant B, and
+    the last-reference cleanup is audited and idempotent.
 
     Returns the number of points deleted.
     """
     name = collection_name or COLLECTION_NAME
     client = get_qdrant_client()
+
+    if grants is None and registry is None:
+        from document_processing.batch_ingestion import default_artifact_cache
+
+        cache = default_artifact_cache()
+        grants = cache.grants
+        registry = cache.registry
+    elif (grants is None) != (registry is None):
+        raise ValueError("grants and registry must be provided together")
 
     # Count before delete for reporting
     before = client.count(
@@ -261,6 +278,13 @@ def delete_document(
             )
         ),
     )
+
+    if grants is not None and registry is not None:
+        from cache.authorization import revoke_document
+
+        revoke_document(
+            grants, registry, user_id=user_id, document_id=document_id
+        )
 
     return before
 

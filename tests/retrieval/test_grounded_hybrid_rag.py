@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 from qdrant_client import models
 
+from document_processing.batch_ingestion import ArtifactCache
 from document_processing.metadata import (
     PAYLOAD_BOOK_TITLE,
     PAYLOAD_COLLECTION_ID,
@@ -22,7 +23,9 @@ from document_processing.metadata import (
 from retrieval import pipeline
 from retrieval.hybrid_search import _build_filter
 from tests.conftest import COLLECTION_ID, USER_ID
+from cache.authorization import GrantStore
 from tools.registry import (
+    REFUSAL_NO_GRANT,
     REFUSAL_NO_GROUNDING,
     REFUSAL_NO_HITS,
     REFUSAL_UNCITABLE,
@@ -194,6 +197,240 @@ def test_scope_reaches_the_retriever_verbatim(retriever):
     assert call["collection_id"] == COLLECTION_ID
     assert call["document_ids"] == ["doc-1"]
     assert call["book_titles"] == ["Book"]
+
+
+# ── Tenant grants gate retrieval and citation resolution ──────────────
+
+
+def test_default_tool_context_uses_one_secure_cache_and_grant_store(
+    tmp_path, monkeypatch
+):
+    cache = ArtifactCache.at(tmp_path / "cache")
+    monkeypatch.setattr("tools.registry.default_artifact_cache", lambda: cache)
+
+    context = ToolContext()
+
+    assert context.cache is cache
+    assert context.authorization is cache.grants
+
+
+def _granted(store: GrantStore, document_id: str) -> None:
+    store.grant(
+        artifact_key="shared-artifact",
+        user_id=USER_ID,
+        collection_id=COLLECTION_ID,
+        document_id=document_id,
+        source_filename="book.md",
+        document_type="md",
+        book_title="Book",
+    )
+
+
+def test_an_un_granted_document_is_an_explicit_refusal(retriever, indexed_books, tmp_path):
+    _, records = indexed_books
+    algorithms = next(
+        record.document_id
+        for record in records
+        if record.book_title == "Foundations of Algorithms"
+    )
+    store = GrantStore(tmp_path / "grants")
+
+    result = call_tool(
+        "retrieve_context",
+        RetrieveContextInput(
+            query=ANSWERABLE,
+            user_id=USER_ID,
+            collection_id=COLLECTION_ID,
+            document_ids=[algorithms],
+        ),
+        ToolContext(retriever=retriever, authorization=store),
+    )
+
+    assert result.grounded is False
+    assert result.refusal is not None
+    assert result.refusal.reason == REFUSAL_NO_GRANT
+    assert result.refusal.scope["document_ids"] == [algorithms]
+
+
+def test_a_granted_document_is_retrievable(retriever, indexed_books, tmp_path):
+    _, records = indexed_books
+    algorithms = next(
+        record.document_id
+        for record in records
+        if record.book_title == "Foundations of Algorithms"
+    )
+    store = GrantStore(tmp_path / "grants")
+    _granted(store, algorithms)
+
+    result = call_tool(
+        "retrieve_context",
+        RetrieveContextInput(
+            query=ANSWERABLE,
+            user_id=USER_ID,
+            collection_id=COLLECTION_ID,
+            document_ids=[algorithms],
+            limit=10,
+        ),
+        ToolContext(retriever=retriever, authorization=store),
+    )
+
+    assert result.grounded is True
+    assert {passage.citation.document_id for passage in result.passages} == {algorithms}
+
+
+def test_a_broad_query_is_narrowed_to_the_tenants_active_grants(
+    retriever, indexed_books, tmp_path
+):
+    _, records = indexed_books
+    algorithms = next(
+        record.document_id
+        for record in records
+        if record.book_title == "Foundations of Algorithms"
+    )
+    store = GrantStore(tmp_path / "grants")
+    _granted(store, algorithms)
+    calls: list[dict] = []
+
+    def recording_retriever(**kwargs):
+        calls.append(kwargs)
+        return retriever(**kwargs)
+
+    result = call_tool(
+        "retrieve_context",
+        RetrieveContextInput(
+            query=ANSWERABLE,
+            user_id=USER_ID,
+            collection_id=COLLECTION_ID,
+            limit=10,
+        ),
+        ToolContext(retriever=recording_retriever, authorization=store),
+    )
+
+    assert result.grounded is True
+    assert calls[0]["document_ids"] == [algorithms]
+    assert {passage.citation.document_id for passage in result.passages} == {algorithms}
+
+
+def test_a_broad_query_without_any_grant_fails_before_retrieval(tmp_path):
+    store = GrantStore(tmp_path / "grants")
+    called = False
+
+    def forbidden_retriever(**kwargs):
+        nonlocal called
+        called = True
+        return []
+
+    result = call_tool(
+        "retrieve_context",
+        RetrieveContextInput(query=ANSWERABLE, user_id="student-c"),
+        ToolContext(retriever=forbidden_retriever, authorization=store),
+    )
+
+    assert result.grounded is False
+    assert result.refusal is not None
+    assert result.refusal.reason == REFUSAL_NO_GRANT
+    assert called is False
+
+
+def test_get_source_location_requires_an_active_grant(indexed_books, tmp_path):
+    index, records = indexed_books
+    target = next(
+        record
+        for record in records
+        if record.book_title == "Database Systems" and record.chunk_index == 2
+    )
+    store = GrantStore(tmp_path / "grants")
+
+    denied = call_tool(
+        "get_source_location",
+        {
+            "user_id": USER_ID,
+            "document_id": target.document_id,
+            "chunk_index": 2,
+            "collection_id": COLLECTION_ID,
+        },
+        ToolContext(locator=locator_over(index.rows), authorization=store),
+    )
+    assert denied.found is False
+    assert "grant" in denied.reason
+
+    _granted(store, target.document_id)
+    allowed = call_tool(
+        "get_source_location",
+        {
+            "user_id": USER_ID,
+            "document_id": target.document_id,
+            "chunk_index": 2,
+            "collection_id": COLLECTION_ID,
+        },
+        ToolContext(locator=locator_over(index.rows), authorization=store),
+    )
+    assert allowed.found is True
+    assert allowed.location.book_title == "Database Systems"
+
+
+def test_revoking_a_grant_locks_the_document_again(retriever, indexed_books, tmp_path):
+    _, records = indexed_books
+    algorithms = next(
+        record.document_id
+        for record in records
+        if record.book_title == "Foundations of Algorithms"
+    )
+    store = GrantStore(tmp_path / "grants")
+    _granted(store, algorithms)
+    store.revoke(USER_ID, algorithms)
+
+    result = call_tool(
+        "retrieve_context",
+        RetrieveContextInput(
+            query=ANSWERABLE,
+            user_id=USER_ID,
+            collection_id=COLLECTION_ID,
+            document_ids=[algorithms],
+        ),
+        ToolContext(retriever=retriever, authorization=store),
+    )
+    assert result.grounded is False
+    assert result.refusal.reason == REFUSAL_NO_GRANT
+
+
+def test_the_pipeline_grant_filter_narrows_the_requested_documents(monkeypatch):
+    seen: list[dict | None] = []
+
+    def fake_search(*, query_text, user_id, limit, collection_name, filters):
+        seen.append(filters)
+        return [_hit("granted-0", "content about hashing", 0.5)]
+
+    monkeypatch.setattr(pipeline, "hybrid_search_rrf", fake_search)
+
+    results = pipeline.retrieve(
+        "hashing",
+        user_id=USER_ID,
+        use_reranking=False,
+        collection_id=COLLECTION_ID,
+        document_ids=["doc-a", "doc-b"],
+        grant_filter=lambda ids: [document_id for document_id in ids if document_id == "doc-b"],
+    )
+
+    assert [item["id"] for item in results] == ["granted-0"]
+    assert seen == [{PAYLOAD_DOCUMENT_ID: "doc-b", PAYLOAD_COLLECTION_ID: COLLECTION_ID}]
+
+
+def test_a_grant_filter_that_allows_nothing_searches_nothing(monkeypatch):
+    def fail_search(**kwargs):
+        raise AssertionError("no document may be searched without a grant")
+
+    monkeypatch.setattr(pipeline, "hybrid_search_rrf", fail_search)
+
+    results = pipeline.retrieve(
+        "hashing",
+        user_id=USER_ID,
+        use_reranking=False,
+        collection_id=COLLECTION_ID,
+        document_ids=["doc-a"],
+        grant_filter=lambda ids: [],
+    )
+    assert results == []
 
 
 # ── Resolving a citation back to the book ─────────────────────────────
