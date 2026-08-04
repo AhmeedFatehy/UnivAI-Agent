@@ -67,6 +67,7 @@ def load_integrated_dependencies() -> None:
             "Set UNIVAI_INTEGRATION_ROOT to the main UnivAI checkout."
         )
     sys.path.insert(0, str(services))
+    sys.path.insert(0, str(ROOT))
     from common.db import execute as db_execute, fetch_one as db_fetch_one
     from common.llm import LLMError as SharedLLMError, complete as llm_complete
 
