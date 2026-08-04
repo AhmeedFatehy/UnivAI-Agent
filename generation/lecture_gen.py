@@ -448,6 +448,53 @@ def write_week(sid: str, week: int, lecture: dict, quiz: list[dict]) -> None:
         encoding="utf-8",
     )
 
+    import hashlib
+    from datetime import datetime, timezone
+
+    def create_artifact(filepath, state):
+        content_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
+        pipeline_hash = hashlib.sha256(b"lecture_gen").hexdigest()
+        content_key = f"sha256:{content_hash}.pipeline:{pipeline_hash}"
+        
+        try:
+            execute(
+                """
+                INSERT INTO content_artifacts 
+                (content_key, schema_version, original_sha256, pipeline_fingerprint, state, byte_length, page_count, artifact_checksum, storage_ref, created_at, updated_at)
+                VALUES (%s, 'content-artifact-v1', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (content_key) DO UPDATE SET storage_ref = EXCLUDED.storage_ref, updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    content_key,
+                    content_hash,
+                    json.dumps({"source": "lecture_gen"}),
+                    state,
+                    len(filepath.read_bytes()),
+                    1,
+                    content_hash,
+                    str(filepath.relative_to(ROOT)),
+                    datetime.now(timezone.utc),
+                    datetime.now(timezone.utc)
+                )
+            )
+        except Exception as e:
+            print(f"Error inserting artifact {filepath}: {e}")
+        return content_key
+
+    if execute is not None:
+        slides_key = create_artifact(folder / "slides.md", "ready")
+        script_key = create_artifact(folder / "script.json", "ready")
+        quiz_key = create_artifact(folder / "quiz.json", "ready")
+        execute(
+            """
+            UPDATE lectures
+            SET script_artifact_key = %s, slides_artifact_key = %s, quiz_artifact_key = %s
+            WHERE student_id = %s AND week = %s
+            """,
+            (script_key, slides_key, quiz_key, sid, week)
+        )
+
+
 
 def build_slides(sid: str) -> None:
     # sid tells the builder to read lectures/<sid>/week-N/slides.md and emit the
