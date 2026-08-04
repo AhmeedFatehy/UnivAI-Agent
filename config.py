@@ -18,6 +18,11 @@ SPARSE_EMBEDDING_MODEL = os.getenv("SPARSE_EMBEDDING_MODEL", "Qdrant/bm25")
 RERANKER_MODEL = os.getenv(
     "RERANKER_MODEL", "Xenova/ms-marco-MiniLM-L-6-v2"
 )
+# Bound peak memory and give concurrent tenants regular scheduling points.  The
+# previous indexer sent every chunk in a textbook through ONNX in one call;
+# one large book could consume several GB and monopolize the MCP server.
+EMBEDDING_BATCH_SIZE = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "16")))
+QDRANT_UPLOAD_BATCH_SIZE = max(1, int(os.getenv("QDRANT_UPLOAD_BATCH_SIZE", "64")))
 
 # ── Chunking Configuration ────────────────────────────────────────────
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))

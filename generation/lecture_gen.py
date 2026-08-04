@@ -208,7 +208,6 @@ def ask_json(prompt: str, system: str, max_tokens: int, check) -> dict:
                 system,
                 max_tokens=max_tokens,
                 force_spec=force,
-                json_mode=True,
             )
         except LLMError as exc:
             last = str(exc)

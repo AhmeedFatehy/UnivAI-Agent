@@ -183,6 +183,12 @@ class CurriculumAgent:
                     user_id=handoff.user_id,
                     collection_id=handoff.collection_id,
                     limit=evidence_limit,
+                    # Topic discovery is intentionally broad: unlike answering
+                    # a specific question, its purpose is to inspect the corpus
+                    # and name what is present. Semantic retrieval plus tenant /
+                    # collection filters provide the scope; citations still bind
+                    # every extracted topic to an actual passage.
+                    min_term_coverage=0.0,
                     use_query_transform=bool(
                         handoff.constraints.get("use_query_transform", False)
                     ),

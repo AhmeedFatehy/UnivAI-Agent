@@ -4,12 +4,19 @@ Exposes RAG capabilities as tools for agents over HTTP.
 """
 import os
 import json
+import sys
+from pathlib import Path
 from mcp.server.fastmcp import FastMCP
+
+CAMPUS_ROOT = Path(__file__).resolve().parent.parent
+if str(CAMPUS_ROOT) not in sys.path:
+    sys.path.insert(0, str(CAMPUS_ROOT))
 
 from runtime import RuntimeMode, runtime_mode
 from retrieval.pipeline import retrieve_formatted
 from document_processing.loaders import load_document
 from document_processing.chunking import chunk_documents
+from document_processing.tenant_jobs import INGESTION_JOBS
 from vector_store.indexing import index_chunks
 from vector_store.collection_manager import list_user_documents, delete_document
 from evaluation.metrics import evaluate_retrieval
@@ -76,14 +83,8 @@ def retrieve_context(
         return f"Error during retrieval: {str(e)}"
 
 
-@mcp.tool()
-def ingest_file(file_path: str, user_id: str) -> str:
-    """Ingest a document file (PDF, DOCX, TXT, HTML, MD) into the user's knowledge base.
-    
-    Args:
-        file_path: Absolute path to the file to ingest.
-        user_id: The ID of the user/student uploading the file.
-    """
+def _ingest_file_sync(file_path: str, user_id: str) -> str:
+    """Blocking ingestion implementation, dispatched by the tenant coordinator."""
     try:
         if runtime_mode() is RuntimeMode.STANDALONE:
             from standalone_store import ingest
@@ -117,6 +118,20 @@ def ingest_file(file_path: str, user_id: str) -> str:
         return f"Successfully ingested {filename}. Created {result['chunks_indexed']} chunks. Document ID: {result['document_id']}"
     except Exception as e:
         return f"Error during ingestion: {str(e)}"
+
+
+@mcp.tool()
+async def ingest_file(file_path: str, user_id: str) -> str:
+    """Ingest a document without blocking jobs belonging to other learners.
+
+    One learner's uploads remain ordered, but every learner has an independent
+    execution lane.  Blocking PDF/ONNX work runs outside FastMCP's event loop.
+
+    Args:
+        file_path: Absolute path to the file to ingest.
+        user_id: The ID of the user/student uploading the file.
+    """
+    return await INGESTION_JOBS.run(user_id, _ingest_file_sync, file_path, user_id)
 
 
 @mcp.tool()
@@ -163,8 +178,7 @@ def remove_document(user_id: str, document_id: str) -> str:
         return f"Error deleting document: {str(e)}"
 
 
-@mcp.tool()
-def ingest_collection(file_paths: list[str], collection_id: str, user_id: str) -> str:
+def _ingest_collection_sync(file_paths: list[str], collection_id: str, user_id: str) -> str:
     """Ingest several books into one collection, tolerating per-book failure.
 
     Each book is loaded, chunked and indexed independently with its own
@@ -188,6 +202,18 @@ def ingest_collection(file_paths: list[str], collection_id: str, user_id: str) -
         return report.model_dump_json(indent=2)
     except Exception as e:
         return f"Error during collection ingestion: {str(e)}"
+
+
+@mcp.tool()
+async def ingest_collection(file_paths: list[str], collection_id: str, user_id: str) -> str:
+    """Ingest a collection without blocking other students' jobs."""
+    return await INGESTION_JOBS.run(
+        user_id,
+        _ingest_collection_sync,
+        file_paths,
+        collection_id,
+        user_id,
+    )
 
 
 @mcp.tool()
@@ -239,8 +265,7 @@ def retrieve_grounded_context(
         return f"Error during grounded retrieval: {str(e)}"
 
 
-@mcp.tool()
-def create_programme_plan(
+def _create_programme_plan_sync(
     programme_title: str,
     collection_id: str,
     user_id: str,
@@ -269,7 +294,11 @@ def create_programme_plan(
 
     try:
         from agents.graph import run_programme
-        from agents.manager import AgentRuntime, ProgrammeRequest, resilient_ollama_llm
+        from agents.manager import AgentRuntime, ProgrammeRequest
+        from services.common.llm import TIMEOUT_GENERATION_S, complete
+
+        def configured_llm(prompt: str) -> str:
+            return complete(prompt, timeout_s=TIMEOUT_GENERATION_S).text
 
         result = run_programme(
             ProgrammeRequest(
@@ -280,11 +309,35 @@ def create_programme_plan(
                 capacity_hours=capacity_hours,
                 max_semesters=max_semesters,
             ),
-            AgentRuntime(llm=resilient_ollama_llm()),
+            # This endpoint builds only the curriculum. Lecture and assessment
+            # generation happen later in their own workflows.
+            AgentRuntime(llm=configured_llm, max_steps=1),
         )
         return result.model_dump_json(indent=2)
     except Exception as e:
         return f"Error during programme planning: {str(e)}"
+
+
+@mcp.tool()
+async def create_programme_plan(
+    programme_title: str,
+    collection_id: str,
+    user_id: str,
+    seed_queries: list[str],
+    capacity_hours: float = 120.0,
+    max_semesters: int = 8,
+) -> str:
+    """Create a programme without blocking jobs belonging to other students."""
+    return await INGESTION_JOBS.run(
+        user_id,
+        _create_programme_plan_sync,
+        programme_title,
+        collection_id,
+        user_id,
+        seed_queries,
+        capacity_hours,
+        max_semesters,
+    )
 
 
 @mcp.tool()

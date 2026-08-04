@@ -152,6 +152,8 @@ def _prompt_versions() -> dict[str, str]:
 
 def runtime_fingerprint() -> RuntimeFingerprint:
     """Build the current runtime configuration fingerprint from live state."""
+    import os
+
     from config import (
         CHUNK_OVERLAP,
         CHUNK_SIZE,
@@ -168,7 +170,7 @@ def runtime_fingerprint() -> RuntimeFingerprint:
 
     return RuntimeFingerprint(
         code_revision=code_revision(),
-        model=LLM_MODEL,
+        model=os.getenv("LLM_PRIMARY", "").strip() or LLM_MODEL,
         dense_embedding_model=DENSE_EMBEDDING_MODEL,
         sparse_embedding_model=SPARSE_EMBEDDING_MODEL,
         reranker_model=RERANKER_MODEL,

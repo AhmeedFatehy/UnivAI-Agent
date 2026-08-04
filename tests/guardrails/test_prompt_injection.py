@@ -7,6 +7,7 @@ on retrieved/source text, which is quoted data and never instruction authority.
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 
 from guardrails.input import (
@@ -181,11 +182,13 @@ def test_flagged_source_text_is_excluded_from_model_evidence():
 def test_programme_planning_screens_every_model_input(title, seeds):
     from mcp_server import create_programme_plan
 
-    result = create_programme_plan(
-        programme_title=title,
-        collection_id="course-1",
-        user_id="user-1",
-        seed_queries=seeds,
+    result = asyncio.run(
+        create_programme_plan(
+            programme_title=title,
+            collection_id="course-1",
+            user_id="user-1",
+            seed_queries=seeds,
+        )
     )
 
     assert result.startswith("REFUSED:")
