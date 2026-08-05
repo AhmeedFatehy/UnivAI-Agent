@@ -19,10 +19,10 @@ def get_qdrant_client() -> QdrantClient:
 @lru_cache(maxsize=1)
 def get_dense_embedder() -> TextEmbedding:
     """Return a singleton dense embedding model."""
-    return TextEmbedding(model_name=DENSE_EMBEDDING_MODEL)
+    return TextEmbedding(model_name=DENSE_EMBEDDING_MODEL, max_length=512, threads=2)
 
 
 @lru_cache(maxsize=1)
 def get_sparse_embedder() -> SparseTextEmbedding:
     """Return a singleton sparse embedding model (BM25)."""
-    return SparseTextEmbedding(model_name=SPARSE_EMBEDDING_MODEL)
+    return SparseTextEmbedding(model_name=SPARSE_EMBEDDING_MODEL, threads=2)
