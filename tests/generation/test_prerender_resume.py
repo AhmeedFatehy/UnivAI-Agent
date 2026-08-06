@@ -7,13 +7,29 @@ import types
 from pathlib import Path
 
 import numpy as np
+import pytest
+
+# prerender_audio.py belongs to UnivAI-live, a SIBLING repository. It is only on
+# disk when this checkout sits inside the campus repo next to it; CI clones
+# UnivAI-Agent on its own, where parents[3] is the runner's work directory and
+# the file does not exist. Skipping keeps the cross-repo check where it is
+# meaningful instead of failing every Agent build that runs without the campus.
+LIVE_DIR = Path(__file__).resolve().parents[3] / "UnivAI-live"
+PRERENDER_AUDIO = LIVE_DIR / "prerender_audio.py"
+
+pytestmark = pytest.mark.skipif(
+    not PRERENDER_AUDIO.is_file(),
+    reason=(
+        f"{PRERENDER_AUDIO} not found — UnivAI-live is a sibling repo, present "
+        "only when the Agent is checked out inside the campus repo."
+    ),
+)
 
 
 def load_prerender_module():
-    live_dir = Path(__file__).resolve().parents[3] / "UnivAI-live"
-    sys.path.insert(0, str(live_dir))
+    sys.path.insert(0, str(LIVE_DIR))
     spec = importlib.util.spec_from_file_location(
-        "resumable_prerender_audio", live_dir / "prerender_audio.py"
+        "resumable_prerender_audio", PRERENDER_AUDIO
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
