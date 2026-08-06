@@ -107,6 +107,11 @@ SLIDES_PER_BATCH = 6
 # lecture instead of a size dial.
 QUESTIONS_PER_10_MINUTES = 3
 SELF_STUDY_QUESTION_RATIO = 0.2
+# The App's largest assessment profile serves 15 quiz questions. Even the
+# shortest lecture must generate at least that many lecturer-grounded options;
+# self-study questions are an additional tail, never a substitute for the
+# served paper's core bank.
+MIN_LECTURE_QUESTIONS = 15
 
 
 def lecture_minutes(page_count: int) -> int:
@@ -123,7 +128,7 @@ def lecture_shape(page_count: int) -> dict:
     """Slides and question counts for a week, derived from its own material."""
     minutes = lecture_minutes(page_count)
     slides = max(3, round(minutes / MINUTES_PER_SLIDE))
-    lecture_qs = max(5, round(minutes / 10 * QUESTIONS_PER_10_MINUTES))
+    lecture_qs = max(MIN_LECTURE_QUESTIONS, round(minutes / 10 * QUESTIONS_PER_10_MINUTES))
     return {
         "minutes": minutes,
         "slides": slides,
@@ -133,9 +138,6 @@ def lecture_shape(page_count: int) -> dict:
     }
 
 
-# Replaced per week in generate_week/build_quiz from lecture_shape(); the
-# module-level value only covers the smallest possible lecture.
-CFG = lecture_shape(0)
 # A 3B model with an 8k window: keep the source well under it.
 MAX_SOURCE_CHARS = 12000
 MAX_CHARS_PER_PAGE = 1500
@@ -279,15 +281,16 @@ def ask_json(prompt: str, system: str, max_tokens: int, check) -> dict:
 def check_lecture(
     data: dict, expected_slides: int | None = None, require_intro: bool = True
 ) -> str | None:
-    expected = CFG["slides"] if expected_slides is None else expected_slides
+    expected = lecture_shape(0)["slides"] if expected_slides is None else expected_slides
     if not isinstance(data.get("title"), str) or not data["title"].strip():
         return "missing title"
     slides = data.get("slides")
     # A couple of slides short is a trim problem, not a rejection: demanding
     # exactly N well-formed slides from a small model kills whole builds over
     # cosmetics. Structural failures still reject.
-    if not isinstance(slides, list) or len(slides) < max(3, expected - 2):
-        return f"need at least {max(3, expected - 2)} slides"
+    minimum = max(1, expected - 2)
+    if not isinstance(slides, list) or len(slides) < minimum:
+        return f"need at least {minimum} slides"
     for slide in slides[:expected]:
         if not isinstance(slide.get("heading"), str) or not slide["heading"].strip():
             return "a slide is missing its heading"
@@ -325,10 +328,9 @@ def generate_week(
     assigned_chapters: str,
     pages: list[tuple[int, str]],
 ) -> dict:
-    global CFG
-    CFG = lecture_shape(len(pages))
+    shape = lecture_shape(len(pages))
     print(
-        f"[lecture-gen]   lecture {week}: ~{CFG['minutes']} min, {CFG['slides']} slides "
+        f"[lecture-gen]   lecture {week}: ~{shape['minutes']} min, {shape['slides']} slides "
         f"from {len(pages)} pages",
         flush=True,
     )
@@ -337,22 +339,24 @@ def generate_week(
     # valid JSON — it runs past the context window and comes back truncated
     # mid-string — so the lecture is built a batch at a time, each batch shown
     # only its own slice of the week's pages, and the slides concatenated.
-    batches = max(1, math.ceil(CFG["slides"] / SLIDES_PER_BATCH))
-    per_batch_pages = max(1, math.ceil(len(pages) / batches))
+    # Every call needs at least one source page. If there are fewer pages than
+    # the ideal number of calls, use fewer slightly larger batches instead of
+    # dropping the final slides (or constructing an empty source slice).
+    batches = max(1, min(len(pages), math.ceil(shape["slides"] / SLIDES_PER_BATCH)))
+    base_slides, extra_slides = divmod(shape["slides"], batches)
     lecture: dict = {}
     for index in range(batches):
-        slice_pages = pages[index * per_batch_pages : (index + 1) * per_batch_pages]
-        if not slice_pages:
-            break
-        remaining = CFG["slides"] - len(lecture.get("slides", []))
-        if remaining <= 0:
-            break
+        page_start = index * len(pages) // batches
+        page_end = (index + 1) * len(pages) // batches
+        slice_pages = pages[page_start:page_end]
+        batch_slides = base_slides + (1 if index < extra_slides else 0)
         part = _generate_batch(
             week,
             total_weeks,
             assigned_chapters,
             slice_pages,
-            slides=min(SLIDES_PER_BATCH, remaining),
+            slides=batch_slides,
+            narration=shape["narration"],
             first=index == 0,
             batch=index + 1,
             batches=batches,
@@ -361,6 +365,12 @@ def generate_week(
             lecture = part
         else:
             lecture["slides"].extend(part["slides"])
+    # ask_json deliberately tolerates a model returning up to two slides short
+    # per call. Never claim the original target if that happened: the assembled
+    # lecture is the source of truth for downstream slides, narration and quiz.
+    if not lecture.get("slides"):
+        raise RuntimeError("lecture generation produced no slides")
+    lecture["durationMinutes"] = shape["minutes"]
     return lecture
 
 
@@ -371,6 +381,7 @@ def _generate_batch(
     pages: list[tuple[int, str]],
     *,
     slides: int,
+    narration: str,
     first: bool,
     batch: int,
     batches: int,
@@ -401,7 +412,7 @@ def _generate_batch(
         + intro_line
         + '  "slides": [\n'
         '    {"heading": "...", "bullets": ["...", "...", "..."], '
-        f'"narration": "{CFG["narration"]} spoken sentences explaining this slide", "page": <page number the content came from>}}\n'
+        f'"narration": "{narration} spoken sentences explaining this slide", "page": <page number the content came from>}}\n'
         "  ]\n"
         "}\n\n"
         f"Rules: exactly {slides} slides. Bullets are short phrases (under 12 words). "
@@ -494,17 +505,18 @@ def ask_questions(prompt: str, count: int, source: str, minimum: int | None = No
 def generate_quiz(
     title: str, segments: list[dict], pages: list[tuple[int, str]]
 ) -> list[dict]:
+    shape = lecture_shape(len(pages))
     # 1) The bulk of the bank: questions a student who WATCHED the lecture finds
     #    easy — every answer must have been said out loud by the lecturer.
     taught = ask_questions(
-        f'Write {CFG["lecture_qs"]} multiple-choice questions testing the TOPICS this lecturer '
+        f'Write {shape["lecture_qs"]} multiple-choice questions testing the TOPICS this lecturer '
         "covered. A student who understood the lecture must be able to answer every one; do not "
         "ask about anything the lecture does not cover. Test the concept, not the wording: never "
         "quote the lecturer's sentences verbatim, never ask what the lecturer 'said' or "
         "'mentioned', and never turn a sentence into a fill-in-the-blank. Plain questions about "
         "the subject matter itself.\n\n" + QUESTION_SHAPE +
         "The lecture:\n" + lecture_text(title, segments),
-        CFG["lecture_qs"],
+        shape["lecture_qs"],
         "lecture",
         # a full quiz paper must be coverable by lecturer-taught questions
         minimum=5,
@@ -512,11 +524,11 @@ def generate_quiz(
 
     # 2) The small self-study tail: from the week's wider pages, beyond the slides.
     homework = ask_questions(
-        f'Write {CFG["self_qs"]} multiple-choice SELF-STUDY questions for the week on '
+        f'Write {shape["self_qs"]} multiple-choice SELF-STUDY questions for the week on '
         f'"{title}", using ONLY these textbook pages. Pick details a short lecture would not '
         "have covered - the student is expected to have read the pages themselves.\n\n"
         + QUESTION_SHAPE + "Textbook pages:\n" + source_block(pages),
-        CFG["self_qs"],
+        shape["self_qs"],
         "self_study",
     )
     return taught + homework
@@ -564,7 +576,12 @@ def write_week(sid: str, week: int, lecture: dict, quiz: list[dict]) -> None:
                 "citations": [{"page": slide["page"]}],
             }
         )
-    script = {"lectureId": f"week-{week}", "title": title, "segments": segments}
+    script = {
+        "lectureId": f"week-{week}",
+        "title": title,
+        "durationMinutes": lecture.get("durationMinutes", LECTURE_MINUTES_MIN),
+        "segments": segments,
+    }
     (folder / "script.json").write_text(
         json.dumps(script, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
