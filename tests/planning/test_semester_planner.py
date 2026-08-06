@@ -4,6 +4,8 @@ import pytest
 from pydantic import ValidationError
 
 from planning.semester_planner import (
+    MAX_CHAPTERS_PER_WEEK,
+    MAX_SEMESTER_WEEKS,
     Chapter,
     ChapterInventory,
     ChapterPart,
@@ -81,7 +83,10 @@ def test_a_large_chapter_is_split_across_two_complete_ranges():
     assert plan.validate_against(source) is plan
 
 
-def test_a_week_rejects_more_than_three_chapters():
+def test_a_week_rejects_more_chapters_than_a_lecture_can_carry():
+    # A week may now carry up to MAX_CHAPTERS_PER_WEEK: compressing chapters
+    # into a week is how a large book fits inside the capped course length, so
+    # the ceiling has to sit above what compression produces, not below it.
     parts = [
         ChapterPart(
             chapter_id=f"C{index:03d}",
@@ -90,9 +95,9 @@ def test_a_week_rejects_more_than_three_chapters():
             end_page=index,
             source_ids=[f"P{index}"],
         )
-        for index in range(1, 5)
+        for index in range(1, MAX_CHAPTERS_PER_WEEK + 2)
     ]
-    with pytest.raises(ValidationError, match="at most 3 items"):
+    with pytest.raises(ValidationError, match=f"at most {MAX_CHAPTERS_PER_WEEK} items"):
         SemesterWeek(
             week=1,
             chapters=parts,
@@ -100,6 +105,44 @@ def test_a_week_rejects_more_than_three_chapters():
             learning_objectives=["learn"],
             source_ids=["P1"],
         )
+
+
+def test_a_week_accepts_compressed_chapters():
+    parts = [
+        ChapterPart(
+            chapter_id=f"C{index:03d}",
+            title=f"Chapter {index}",
+            start_page=index,
+            end_page=index,
+            source_ids=[f"P{index}"],
+        )
+        for index in range(1, MAX_CHAPTERS_PER_WEEK + 1)
+    ]
+    week = SemesterWeek(
+        week=1,
+        chapters=parts,
+        rationale="compressed",
+        learning_objectives=["learn"],
+        source_ids=["P1"],
+    )
+    assert len(week.chapters) == MAX_CHAPTERS_PER_WEEK
+
+
+def test_a_course_never_exceeds_the_three_month_ceiling():
+    # 40 one-page chapters would once have produced a 40-week course.
+    source = inventory([chapter(index, index, index) for index in range(1, 41)])
+    plan = plan_semester(source)
+    assert plan.week_count <= MAX_SEMESTER_WEEKS
+    covered = sum(len(week.chapters) for week in plan.weeks)
+    assert covered == 40, "compression must not drop chapters"
+    assert plan.validate_against(source) is plan
+
+
+def test_a_small_book_keeps_its_natural_length():
+    source = inventory([chapter(index, index, index) for index in range(1, 6)])
+    plan = plan_semester(source)
+    assert plan.week_count == 5
+    assert all(len(week.chapters) == 1 for week in plan.weeks)
 
 
 def test_validation_rejects_missing_chapters():

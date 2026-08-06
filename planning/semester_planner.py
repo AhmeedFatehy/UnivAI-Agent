@@ -17,6 +17,18 @@ from pydantic import BaseModel, Field, model_validator
 SEMESTER_PLAN_SCHEMA = "univai.semester.week-plan"
 SEMESTER_PLAN_VERSION = "1.0.0"
 
+# ── The shape a course is allowed to take ─────────────────────────────
+#
+# One book is one course and one semester, and is never split across two.
+# A semester runs two months. A book that genuinely carries more may stretch
+# it by a week at a time to three months, and no further: past that the extra
+# chapters are folded into the weeks that already exist, so the LECTURE gets
+# longer rather than the COURSE. That is the whole trade — a course that
+# outgrows three months is compressed, never extended.
+WEEKS_PER_MONTH = 4
+TARGET_SEMESTER_WEEKS = 2 * WEEKS_PER_MONTH  # 8 — two months, the normal course
+MAX_SEMESTER_WEEKS = 3 * WEEKS_PER_MONTH  # 12 — three months, the hard ceiling
+
 
 class ChapterSize(str, Enum):
     TINY = "tiny"
@@ -84,18 +96,29 @@ class ChapterPart(BaseModel):
         return self
 
 
+#: Chapters one week's lecture may cover. Three was right while a course could
+#: run as long as the book demanded; now that a course is capped at
+#: MAX_SEMESTER_WEEKS, compressing chapters into a week is the only way a large
+#: book fits, so this has to clear the ceiling rather than fight it. Twelve per
+#: week over twelve weeks covers a 144-chapter book — past that the book is not
+#: one course.
+MAX_CHAPTERS_PER_WEEK = 12
+
+
 class SemesterWeek(BaseModel):
     week: int = Field(ge=1)
-    chapters: list[ChapterPart] = Field(min_length=1, max_length=3)
+    chapters: list[ChapterPart] = Field(min_length=1, max_length=MAX_CHAPTERS_PER_WEEK)
     rationale: str = Field(min_length=1)
     learning_objectives: list[str] = Field(min_length=1)
     source_ids: list[str] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def _week_has_at_most_three_chapters(self) -> "SemesterWeek":
+    def _week_chapters_are_distinct(self) -> "SemesterWeek":
         ids = {chapter.chapter_id for chapter in self.chapters}
-        if len(ids) > 3:
-            raise ValueError("a week cannot contain more than three chapters")
+        if len(ids) > MAX_CHAPTERS_PER_WEEK:
+            raise ValueError(
+                f"a week cannot contain more than {MAX_CHAPTERS_PER_WEEK} chapters"
+            )
         if len(ids) != len(self.chapters):
             raise ValueError("two parts of one chapter cannot share a week")
         return self
@@ -336,6 +359,36 @@ def _week(week: int, parts: list[ChapterPart], rationale: str) -> SemesterWeek:
     )
 
 
+def _compress_to_limit(weeks: list[SemesterWeek], limit: int) -> list[SemesterWeek]:
+    """Fold adjacent weeks together until the plan fits `limit` weeks.
+
+    Only neighbours are merged and their order is kept, so every chapter stays
+    covered, in order and adjacent — the invariants validate_against enforces.
+    The weeks simply carry more chapters each, which is the point: a book with
+    twenty chapters becomes a longer lecture twelve times, not a twenty-week
+    course.
+    """
+    total = len(weeks)
+    if total <= limit:
+        return weeks
+
+    merged: list[SemesterWeek] = []
+    for position in range(limit):
+        # Even split: bucket i takes weeks[i*total//limit : (i+1)*total//limit],
+        # which spreads the remainder instead of piling it on the last week.
+        bucket = weeks[position * total // limit : (position + 1) * total // limit]
+        parts = [part for week in bucket for part in week.chapters]
+        merged.append(
+            _week(
+                position + 1,
+                parts,
+                f"{len(parts)} chapters combined into one longer lecture to keep the "
+                f"course within {limit // WEEKS_PER_MONTH} months.",
+            )
+        )
+    return merged
+
+
 def plan_semester(inventory: ChapterInventory) -> SemesterWeekPlan:
     """Build a deterministic valid plan from the chapter inventory."""
     chapters = inventory.chapters
@@ -372,12 +425,29 @@ def plan_semester(inventory: ChapterInventory) -> SemesterWeekPlan:
         weeks.append(_week(len(weeks) + 1, [_whole_part(item) for item in group], rationale))
         index += len(group)
 
+    natural_weeks = len(weeks)
+    weeks = _compress_to_limit(weeks, MAX_SEMESTER_WEEKS)
+    warnings = list(inventory.warnings)
+    if natural_weeks > MAX_SEMESTER_WEEKS:
+        warnings.append(
+            f"The book's {natural_weeks} chapter groups exceed the "
+            f"{MAX_SEMESTER_WEEKS}-week ({MAX_SEMESTER_WEEKS // WEEKS_PER_MONTH}-month) "
+            f"ceiling, so they were compressed into {len(weeks)} longer lectures."
+        )
+    elif natural_weeks > TARGET_SEMESTER_WEEKS:
+        warnings.append(
+            f"The book needs {natural_weeks} weeks, beyond the usual "
+            f"{TARGET_SEMESTER_WEEKS}-week ({TARGET_SEMESTER_WEEKS // WEEKS_PER_MONTH}-month) "
+            "semester, so the course runs long by "
+            f"{natural_weeks - TARGET_SEMESTER_WEEKS} week(s)."
+        )
+
     plan = SemesterWeekPlan(
         book_title=inventory.book_title,
         week_count=len(weeks),
         weeks=weeks,
         confidence=inventory.confidence,
-        warnings=inventory.warnings,
+        warnings=warnings,
     )
     return plan.validate_against(inventory)
 
