@@ -22,6 +22,11 @@ from vector_store.collection_manager import list_user_documents, delete_document
 from evaluation.metrics import evaluate_retrieval
 from tools.registry import TOOL_REGISTRY, TOOL_SCHEMA_VERSION, call_tool
 
+#: Output budget for programme planning. The curriculum agent extracts up to
+#: DEFAULT_MAX_TOPICS (8) topics, each with a summary, keywords and cited
+#: evidence, so the reply runs to thousands of tokens.
+PLANNING_MAX_TOKENS = int(os.environ.get("PLANNING_MAX_TOKENS", "4096"))
+
 # Create the MCP server instance. The defaults preserve the integrated contract;
 # environment overrides let bounded standalone smoke tests avoid occupied ports.
 mcp = FastMCP(
@@ -297,8 +302,17 @@ def _create_programme_plan_sync(
         from agents.manager import AgentRuntime, ProgrammeRequest
         from services.common.llm import TIMEOUT_GENERATION_S, complete
 
+        # max_tokens is what marks this as a generation call, not a spoken
+        # answer. Without it the shared adapter caps the reply at 180 tokens
+        # and leaves the context window at its 4k default, so topic extraction
+        # came back truncated mid-string ("response is not valid JSON:
+        # Unterminated string") while the prompt's evidence block was itself
+        # being silently cut. Eight topics with summaries, keywords and
+        # citations need real room.
         def configured_llm(prompt: str) -> str:
-            return complete(prompt, timeout_s=TIMEOUT_GENERATION_S).text
+            return complete(
+                prompt, max_tokens=PLANNING_MAX_TOKENS, timeout_s=TIMEOUT_GENERATION_S
+            ).text
 
         result = run_programme(
             ProgrammeRequest(
