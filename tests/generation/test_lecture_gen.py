@@ -137,3 +137,32 @@ def test_quiz_size_is_derived_per_week_including_quiz_only_regeneration(monkeypa
         long["lecture_qs"],
         long["self_qs"],
     ]
+
+
+def test_generation_manifest_resumes_only_the_same_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(lecture_gen, "LECTURES_DIR", tmp_path)
+    week = tmp_path / "student-1" / "week-1"
+    week.mkdir(parents=True)
+    (week / "script.json").write_text('{"segments": [{"text": "ready"}]}', encoding="utf-8")
+
+    assert lecture_gen.prepare_generation_manifest("student-1", 7, "a" * 64, 3) is True
+    assert lecture_gen.prepare_generation_manifest("student-1", 7, "a" * 64, 3) is True
+    assert lecture_gen.prepare_generation_manifest("student-1", 8, "b" * 64, 3) is False
+
+
+def test_lecture_checkpoint_survives_without_legacy_full_lecture_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(lecture_gen, "LECTURES_DIR", tmp_path)
+    folder = tmp_path / "student-1" / "week-1"
+    folder.mkdir(parents=True)
+    (folder / "script.json").write_text(
+        json.dumps({"segments": [{"text": "Saved narration"}]}),
+        encoding="utf-8",
+    )
+    (folder / "slides.md").write_text("# Saved deck\n", encoding="utf-8")
+    (folder / "quiz.json").write_text(
+        json.dumps({"questions": [{"stem": "Saved question"}]}),
+        encoding="utf-8",
+    )
+
+    assert lecture_gen.valid_lecture_checkpoint("student-1", 1) is True
+    assert lecture_gen.valid_quiz_checkpoint("student-1", 1) is True
