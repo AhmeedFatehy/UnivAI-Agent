@@ -80,12 +80,12 @@ def load_integrated_dependencies() -> None:
 
 # ── Lecture length ────────────────────────────────────────────────────
 #
-# A lecture runs 30 to 120 minutes and has to carry its week's chapters. There
+# A theoretical lecture runs 45 to 120 minutes and has to carry its week's chapters. There
 # is no admin dial any more: the length follows the material. A week that
 # compresses several chapters — the semester planner's answer to a book too big
 # for three months — is simply a longer lecture, which is the trade the planner
 # is making on purpose.
-LECTURE_MINUTES_MIN = 30
+LECTURE_MINUTES_MIN = 45
 LECTURE_MINUTES_MAX = 120
 # Roughly what a page of textbook is worth once it is spoken rather than read.
 MINUTES_PER_PAGE = 2.0
@@ -115,7 +115,7 @@ MIN_LECTURE_QUESTIONS = 15
 
 
 def lecture_minutes(page_count: int) -> int:
-    """How long this week's material is worth, inside the 30-120 bound."""
+    """How long this week's material is worth, inside the 45-120 bound."""
     return int(
         max(
             LECTURE_MINUTES_MIN,
@@ -166,7 +166,10 @@ def read_pages(pdf_path: Path) -> list[tuple[int, str]]:
             text = re.sub(r"[ \t]+", " ", (page.extract_text() or "")).strip()
         except Exception:
             text = ""
-        if len(text) >= 40:  # covers, blank pages, pure-image pages
+        # Keep short title-only pages: slide decks often introduce a new
+        # chapter with nothing except its heading. Dropping those pages erased
+        # real chapter boundaries and made later body bullets look authoritative.
+        if len(re.sub(r"\W+", "", text)) >= 3:  # blanks and pure-image pages stay out
             pages.append((index, text))
     return pages
 
@@ -335,7 +338,7 @@ def generate_week(
         flush=True,
     )
 
-    # A 30-120 minute lecture is 30-125 slides. One call cannot return that as
+    # A 45-120 minute lecture is roughly 47-125 slides. One call cannot return that as
     # valid JSON — it runs past the context window and comes back truncated
     # mid-string — so the lecture is built a batch at a time, each batch shown
     # only its own slice of the week's pages, and the slides concatenated.
@@ -767,7 +770,7 @@ def main() -> int:
         pages = read_pages(pdf_path)
         execute("UPDATE books SET pages = %s WHERE id = %s", (len(pages), book_id))
         book_title = book.get("title") or book.get("filename") or pdf_path.stem
-        progress(book_id, "Finding chapters and planning the semester…")
+        progress(book_id, "Finding chapters and planning the course…")
         plan, weeks = build_semester_plan(pages, book_title)
         total_weeks = plan.week_count
         write_semester_plan(sid, plan)
