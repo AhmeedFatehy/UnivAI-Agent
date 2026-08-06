@@ -17,6 +17,7 @@ split — the model is never trusted to invent one.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -77,21 +78,64 @@ def load_integrated_dependencies() -> None:
     LLMError = SharedLLMError
     LECTURES_DIR = Path(os.getenv("LECTURES_DIR", str(ROOT / "lectures"))).resolve()
 
-# The course size dial (settings.course_size, set from the admin page). One
-# knob scales the lecture and the quiz bank together. The app holds the SAME
-# table in app/lib/course-size.ts — keep them in sync.
+# ── Lecture length ────────────────────────────────────────────────────
+#
+# A lecture runs 30 to 120 minutes and has to carry its week's chapters. There
+# is no admin dial any more: the length follows the material. A week that
+# compresses several chapters — the semester planner's answer to a book too big
+# for three months — is simply a longer lecture, which is the trade the planner
+# is making on purpose.
+LECTURE_MINUTES_MIN = 30
+LECTURE_MINUTES_MAX = 120
+# Roughly what a page of textbook is worth once it is spoken rather than read.
+MINUTES_PER_PAGE = 2.0
+# Measured against the pre-rendered Kokoro voice.
+SPOKEN_WORDS_PER_MINUTE = 150
+NARRATION_SENTENCES_PER_SLIDE = 8
+WORDS_PER_NARRATION_SENTENCE = 18
+MINUTES_PER_SLIDE = (
+    NARRATION_SENTENCES_PER_SLIDE * WORDS_PER_NARRATION_SENTENCE
+) / SPOKEN_WORDS_PER_MINUTE
+# Slides asked for in ONE model call. A 120-minute lecture is ~125 slides and
+# tens of thousands of tokens — far past what any single JSON reply survives,
+# which is why the lecture is generated in batches and concatenated. Small
+# enough that a reply still parses; large enough that a batch is worth a call.
+SLIDES_PER_BATCH = 6
 # The quiz bank per week: >=90% of any served paper must be answerable from
 # what the lecturer SAID (easy if you attended); self-study questions from the
-# wider pages exist but can never exceed 10% of a paper.
-SIZES = {
-    "XS": {"slides": 3, "narration": "4-6", "lecture_qs": 8, "self_qs": 2},
-    "S": {"slides": 5, "narration": "4-6", "lecture_qs": 10, "self_qs": 2},
-    "M": {"slides": 8, "narration": "5-7", "lecture_qs": 14, "self_qs": 3},
-    "L": {"slides": 12, "narration": "6-8", "lecture_qs": 18, "self_qs": 4},
-    "XL": {"slides": 16, "narration": "6-9", "lecture_qs": 22, "self_qs": 5},
-}
-# Filled in main() from the settings table; XS keeps the original behaviour.
-CFG = SIZES["XS"]
+# wider pages exist but can never exceed 10% of a paper. Both scale with the
+# lecture instead of a size dial.
+QUESTIONS_PER_10_MINUTES = 3
+SELF_STUDY_QUESTION_RATIO = 0.2
+
+
+def lecture_minutes(page_count: int) -> int:
+    """How long this week's material is worth, inside the 30-120 bound."""
+    return int(
+        max(
+            LECTURE_MINUTES_MIN,
+            min(LECTURE_MINUTES_MAX, round(page_count * MINUTES_PER_PAGE)),
+        )
+    )
+
+
+def lecture_shape(page_count: int) -> dict:
+    """Slides and question counts for a week, derived from its own material."""
+    minutes = lecture_minutes(page_count)
+    slides = max(3, round(minutes / MINUTES_PER_SLIDE))
+    lecture_qs = max(5, round(minutes / 10 * QUESTIONS_PER_10_MINUTES))
+    return {
+        "minutes": minutes,
+        "slides": slides,
+        "narration": f"{NARRATION_SENTENCES_PER_SLIDE - 2}-{NARRATION_SENTENCES_PER_SLIDE + 1}",
+        "lecture_qs": lecture_qs,
+        "self_qs": max(2, round(lecture_qs * SELF_STUDY_QUESTION_RATIO)),
+    }
+
+
+# Replaced per week in generate_week/build_quiz from lecture_shape(); the
+# module-level value only covers the smallest possible lecture.
+CFG = lecture_shape(0)
 # A 3B model with an 8k window: keep the source well under it.
 MAX_SOURCE_CHARS = 12000
 MAX_CHARS_PER_PAGE = 1500
@@ -232,16 +276,19 @@ def ask_json(prompt: str, system: str, max_tokens: int, check) -> dict:
 # ---------------------------------------------------------------- lecture generation
 
 
-def check_lecture(data: dict) -> str | None:
+def check_lecture(
+    data: dict, expected_slides: int | None = None, require_intro: bool = True
+) -> str | None:
+    expected = CFG["slides"] if expected_slides is None else expected_slides
     if not isinstance(data.get("title"), str) or not data["title"].strip():
         return "missing title"
     slides = data.get("slides")
     # A couple of slides short is a trim problem, not a rejection: demanding
     # exactly N well-formed slides from a small model kills whole builds over
     # cosmetics. Structural failures still reject.
-    if not isinstance(slides, list) or len(slides) < max(3, CFG["slides"] - 2):
-        return f"need at least {max(3, CFG['slides'] - 2)} slides"
-    for slide in slides[: CFG["slides"]]:
+    if not isinstance(slides, list) or len(slides) < max(3, expected - 2):
+        return f"need at least {max(3, expected - 2)} slides"
+    for slide in slides[:expected]:
         if not isinstance(slide.get("heading"), str) or not slide["heading"].strip():
             return "a slide is missing its heading"
         bullets = slide.get("bullets")
@@ -253,9 +300,23 @@ def check_lecture(data: dict) -> str | None:
             return "each slide needs spoken narration of at least 15 words"
         if not isinstance(slide.get("page"), int):
             return "each slide needs the page number it came from"
-    if not isinstance(data.get("intro"), str) or not data["intro"].strip():
+    # Only the opening batch introduces the lecture; the ones that continue it
+    # are told to leave intro empty so the lecturer does not greet the room
+    # again halfway through.
+    if require_intro and (
+        not isinstance(data.get("intro"), str) or not data["intro"].strip()
+    ):
         return "missing intro"
     return None
+
+
+def _slide_check(slides: int, first: bool = True):
+    """check_lecture bound to one batch's slide count."""
+
+    def check(data: dict) -> str | None:
+        return check_lecture(data, expected_slides=slides, require_intro=first)
+
+    return check
 
 
 def generate_week(
@@ -264,32 +325,97 @@ def generate_week(
     assigned_chapters: str,
     pages: list[tuple[int, str]],
 ) -> dict:
+    global CFG
+    CFG = lecture_shape(len(pages))
+    print(
+        f"[lecture-gen]   lecture {week}: ~{CFG['minutes']} min, {CFG['slides']} slides "
+        f"from {len(pages)} pages",
+        flush=True,
+    )
+
+    # A 30-120 minute lecture is 30-125 slides. One call cannot return that as
+    # valid JSON — it runs past the context window and comes back truncated
+    # mid-string — so the lecture is built a batch at a time, each batch shown
+    # only its own slice of the week's pages, and the slides concatenated.
+    batches = max(1, math.ceil(CFG["slides"] / SLIDES_PER_BATCH))
+    per_batch_pages = max(1, math.ceil(len(pages) / batches))
+    lecture: dict = {}
+    for index in range(batches):
+        slice_pages = pages[index * per_batch_pages : (index + 1) * per_batch_pages]
+        if not slice_pages:
+            break
+        remaining = CFG["slides"] - len(lecture.get("slides", []))
+        if remaining <= 0:
+            break
+        part = _generate_batch(
+            week,
+            total_weeks,
+            assigned_chapters,
+            slice_pages,
+            slides=min(SLIDES_PER_BATCH, remaining),
+            first=index == 0,
+            batch=index + 1,
+            batches=batches,
+        )
+        if not lecture:
+            lecture = part
+        else:
+            lecture["slides"].extend(part["slides"])
+    return lecture
+
+
+def _generate_batch(
+    week: int,
+    total_weeks: int,
+    assigned_chapters: str,
+    pages: list[tuple[int, str]],
+    *,
+    slides: int,
+    first: bool,
+    batch: int,
+    batches: int,
+) -> dict:
+    """One model call: `slides` slides covering only `pages`."""
     valid_pages = [number for number, _ in pages]
+    intro_line = (
+        '  "intro": "2 spoken sentences welcoming students and saying what this lecture covers",\n'
+        if first
+        else '  "intro": "",\n'
+    )
+    continues = (
+        ""
+        if first
+        else f"This is part {batch} of {batches} of the same lecture: continue from where "
+        "part " + str(batch - 1) + " stopped, do not re-introduce the lecture or repeat "
+        "material already covered.\n"
+    )
     prompt = (
         f"These are pages {valid_pages[0]}-{valid_pages[-1]} of a textbook. "
         f"Create lecture {week} of a {total_weeks}-week course from them. "
-        f"This week covers: {assigned_chapters}.\n\n"
+        f"This week covers: {assigned_chapters}.\n"
+        + continues
+        + "\n"
         "Return exactly this JSON shape:\n"
         "{\n"
         '  "title": "short lecture title",\n'
-        '  "intro": "2 spoken sentences welcoming students and saying what this lecture covers",\n'
-        '  "slides": [\n'
+        + intro_line
+        + '  "slides": [\n'
         '    {"heading": "...", "bullets": ["...", "...", "..."], '
         f'"narration": "{CFG["narration"]} spoken sentences explaining this slide", "page": <page number the content came from>}}\n'
         "  ]\n"
         "}\n\n"
-        f"Rules: exactly {CFG['slides']} slides. Bullets are short phrases (under 12 words). "
+        f"Rules: exactly {slides} slides. Bullets are short phrases (under 12 words). "
         "Narration is natural speech - no bullet symbols, no 'as you can see'. "
         f'"page" must be one of {valid_pages}.\n\n'
         "Textbook pages:\n" + source_block(pages)
     )
-    # Bigger sizes produce longer JSON: give the reply room to finish. A small
-    # model narrates verbosely — an M-size reply got cut at 260 tokens/slide.
-    data = ask_json(prompt, LECTURE_SYSTEM, 800 + 340 * CFG["slides"], check_lecture)
+    # Give the reply room to finish: a verbose narrator ran an M-size reply out
+    # of tokens at 260/slide. Only ever one batch's worth, never the lecture's.
+    data = ask_json(prompt, LECTURE_SYSTEM, 800 + 340 * slides, _slide_check(slides, first))
     # "Lecture 2: Consistency Models" — the deck already says Week N, and the
     # colon broke the deck's YAML headmatter once. Strip the redundant prefix.
     data["title"] = re.sub(r"^Lecture\s*\d+\s*[:\-–—]\s*", "", data["title"].strip())
-    data["slides"] = data["slides"][: CFG["slides"]]
+    data["slides"] = data["slides"][:slides]
     for slide in data["slides"]:
         # never trust a model with page numbers: clamp to the pages it was shown
         if slide["page"] not in valid_pages:
@@ -611,13 +737,13 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": f"book {book_id} has no owner (student_id)"}))
         return 2
 
-    # The admin's size dial. Set on the admin page, honoured here.
-    global CFG
-    size_row = fetch_one("SELECT value FROM settings WHERE key = 'course_size'")
-    size = (size_row or {}).get("value", "XS")
-    CFG = SIZES.get(size, SIZES["XS"])
-    print(f"[lecture-gen] course size: {size} ({CFG['slides']} slides, "
-          f"{CFG['lecture_qs']}+{CFG['self_qs']} questions per week)", flush=True)
+    # No size dial: each week's lecture is sized from its own material in
+    # generate_week, so a week carrying more chapters is simply a longer lecture.
+    print(
+        f"[lecture-gen] lectures run {LECTURE_MINUTES_MIN}-{LECTURE_MINUTES_MAX} min, "
+        "sized per week from its pages",
+        flush=True,
+    )
 
     try:
         progress(book_id, "Reading the book…")
