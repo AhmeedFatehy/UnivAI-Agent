@@ -43,6 +43,24 @@ def test_semester_plan_is_saved_for_other_endpoints(tmp_path, monkeypatch):
     assert saved["semesters"][0]["quiz_count"] == 3
 
 
+def test_regeneration_removes_only_obsolete_tail_weeks(tmp_path, monkeypatch):
+    lectures = tmp_path / "lectures"
+    slides = tmp_path / "UnivAI-app" / "public" / "slides"
+    monkeypatch.setattr(lecture_gen, "ROOT", tmp_path)
+    monkeypatch.setattr(lecture_gen, "LECTURES_DIR", lectures)
+    for root in (lectures / "student-1", slides / "student-1"):
+        (root / "week-1").mkdir(parents=True)
+        (root / "week-2").mkdir()
+        (root / "notes").mkdir()
+
+    lecture_gen.remove_obsolete_weeks("student-1", 1)
+
+    for root in (lectures / "student-1", slides / "student-1"):
+        assert (root / "week-1").is_dir()
+        assert not (root / "week-2").exists()
+        assert (root / "notes").is_dir()
+
+
 def test_minimum_lecture_batches_all_slides_without_an_impossible_tail(monkeypatch):
     pages = [(page, f"Page {page}") for page in range(1, 6)]
     calls: list[tuple[list[int], int, bool]] = []

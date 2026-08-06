@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -191,6 +192,32 @@ def write_semester_plan(sid: str, plan: SemesterWeekPlan) -> None:
     (folder / "semester-plan.json").write_text(
         plan.model_dump_json(indent=2) + "\n", encoding="utf-8"
     )
+
+
+def remove_obsolete_weeks(sid: str, week_count: int) -> None:
+    """Remove only a regenerated course's now-invalid tail weeks.
+
+    A corrected detector may shorten a plan. Leaving the old folders behind
+    makes slide builds and manual inspection disagree with semester-plan.json.
+    Both roots are resolved and every deletion is containment-checked before
+    it happens; no path outside this student's generated namespace is touched.
+    """
+
+    roots = [
+        (LECTURES_DIR / sid).resolve(),
+        (ROOT / "UnivAI-app" / "public" / "slides" / sid).resolve(),
+    ]
+    for course_root in roots:
+        if not course_root.is_dir():
+            continue
+        for folder in course_root.glob("week-*"):
+            match = re.fullmatch(r"week-(\d+)", folder.name)
+            if not match or int(match.group(1)) <= week_count:
+                continue
+            target = folder.resolve()
+            if course_root not in target.parents:
+                raise RuntimeError(f"refusing to remove week outside {course_root}")
+            shutil.rmtree(target)
 
 
 def source_block(pages: list[tuple[int, str]]) -> str:
@@ -774,6 +801,7 @@ def main() -> int:
         plan, weeks = build_semester_plan(pages, book_title)
         total_weeks = plan.week_count
         write_semester_plan(sid, plan)
+        remove_obsolete_weeks(sid, total_weeks)
 
         if quizzes_only:
             regenerate_quizzes(sid, book_id, weeks)
