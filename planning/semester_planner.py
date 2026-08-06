@@ -301,8 +301,8 @@ _CHAPTER_RE = re.compile(
 _NUMBERED_HEADING_RE = re.compile(
     r"^\s*(?P<number>\d{1,3})[.:\-]\s+(?P<title>[A-Z][^.!?]{2,90})\s*$"
 )
-_AGENDA_HEADING_RE = re.compile(r"^(agenda|outline|contents|table of contents)$", re.I)
-_AGENDA_ITEM_RE = re.compile(
+_CONTENTS_HEADING_RE = re.compile(r"^(contents|table of contents)$", re.I)
+_CONTENTS_ITEM_RE = re.compile(
     r"^\s*(?P<number>\d{1,3})[.)]\s+(?P<title>.+?)\s*[.]?\s*$"
 )
 _HEADING_STOP_WORDS = {"a", "an", "and", "for", "is", "of", "the", "to", "when"}
@@ -331,21 +331,21 @@ def _heading_similarity(expected: str, candidate: str) -> float:
     return max(dice, sequence if sequence >= 0.8 else 0.0)
 
 
-def _agenda_chapter_candidates(
+def _contents_chapter_candidates(
     pages: list[tuple[int, str]],
 ) -> list[tuple[int, str, str]]:
-    """Use a slide deck's own agenda instead of mistaking bullets for chapters."""
-    for agenda_page, text in pages:
+    """Map an explicit contents page to the corresponding chapter starts."""
+    for contents_page, text in pages:
         lines = [line.strip() for line in text.splitlines()[:30] if line.strip()]
         agenda_index = next(
-            (index for index, line in enumerate(lines) if _AGENDA_HEADING_RE.match(line)),
+            (index for index, line in enumerate(lines) if _CONTENTS_HEADING_RE.match(line)),
             None,
         )
         if agenda_index is None:
             continue
         agenda_items = []
         for line in lines[agenda_index + 1 :]:
-            match = _AGENDA_ITEM_RE.match(line)
+            match = _CONTENTS_ITEM_RE.match(line)
             if match:
                 agenda_items.append(
                     (match.group("number"), match.group("title").strip(" .:-–—"))
@@ -354,7 +354,7 @@ def _agenda_chapter_candidates(
             continue
 
         located: list[tuple[int, str, str]] = []
-        next_page = agenda_page + 1
+        next_page = contents_page + 1
         for number, title in agenda_items:
             best: tuple[float, int] | None = None
             for page_number, page_text in pages:
@@ -367,8 +367,8 @@ def _agenda_chapter_candidates(
                     (_heading_similarity(title, line) for line in heading_lines),
                     default=0.0,
                 )
-                # Agenda items sometimes combine two consecutive slide
-                # headings (for example "Advantages and Disadvantages"). The
+                # Contents items sometimes combine two consecutive headings
+                # (for example "Advantages and Disadvantages"). The
                 # first credible match is the chapter boundary; choosing a
                 # later, slightly closer wording would swallow the first half.
                 if score >= 0.65:
@@ -434,7 +434,7 @@ def discover_chapters(
 
     candidates = (
         explicit_candidates
-        or _agenda_chapter_candidates(pages)
+        or _contents_chapter_candidates(pages)
         or _numbered_chapter_candidates(pages)
     )
 

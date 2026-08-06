@@ -221,7 +221,7 @@ def test_canonical_course_shapes(
     assert sum(len(week.chapters) for week in plan.weeks) == chapter_count
 
 
-def test_slide_deck_agenda_defines_chapters_and_body_bullets_do_not():
+def test_slide_deck_agenda_stays_inside_one_lecture_and_body_bullets_do_not_split_it():
     pages = [
         (1, "Course Learning Outcomes\n1. Understand the basic principles of the field of"),
         (
@@ -241,11 +241,20 @@ def test_slide_deck_agenda_defines_chapters_and_body_bullets_do_not():
 
     found = discover_chapters(pages, "Modeling and Simulation")
 
-    assert [chapter.title for chapter in found.chapters] == [
-        "General introduction",
-        "When Simulation is the Appropriate Tool",
-        "When Simulation is Not Appropriate",
-        "Advantages and Disadvantages of Simulation",
-        "Areas of Application",
+    assert len(found.chapters) == 1
+    assert found.chapters[0].title == "Modeling and Simulation"
+    assert (found.chapters[0].start_page, found.chapters[0].end_page) == (1, 9)
+    assert found.confidence < 0.5
+
+
+def test_explicit_contents_entries_can_define_unlabelled_chapters():
+    pages = [
+        (1, "Table of Contents\n1. Foundations\n2. Advanced Systems"),
+        (2, "Foundations\nCore concepts"),
+        (10, "Advanced Systems\nMore concepts"),
     ]
-    assert [chapter.start_page for chapter in found.chapters] == [1, 4, 6, 7, 9]
+
+    found = discover_chapters(pages, "Systems")
+
+    assert [chapter.title for chapter in found.chapters] == ["Foundations", "Advanced Systems"]
+    assert [chapter.start_page for chapter in found.chapters] == [1, 10]
