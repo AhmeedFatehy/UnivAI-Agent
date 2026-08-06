@@ -49,7 +49,7 @@ def test_normal_chapters_become_one_week_each():
     ]
 
 
-def test_small_adjacent_chapters_can_share_a_week():
+def test_small_book_keeps_one_chapter_per_week_regardless_of_page_size():
     plan = plan_semester(
         inventory(
             [
@@ -59,27 +59,28 @@ def test_small_adjacent_chapters_can_share_a_week():
             ]
         )
     )
-    assert [part.chapter_id for part in plan.weeks[0].chapters] == ["C001", "C002"]
+    assert [[part.chapter_id for part in week.chapters] for week in plan.weeks] == [
+        ["C001"],
+        ["C002"],
+        ["C003"],
+    ]
 
 
-def test_three_tiny_chapters_fit_but_a_fourth_starts_another_week():
+def test_tiny_chapters_are_still_distinct_theory_lectures_in_a_small_book():
     plan = plan_semester(
         inventory(
             [chapter(index, index * 2 - 1, index * 2, ChapterSize.TINY) for index in range(1, 5)]
         )
     )
-    assert [len(week.chapters) for week in plan.weeks] == [3, 1]
+    assert [len(week.chapters) for week in plan.weeks] == [1, 1, 1, 1]
 
 
-def test_a_large_chapter_is_split_across_two_complete_ranges():
+def test_one_large_chapter_remains_one_lecture():
     source = inventory([chapter(1, 1, 100, ChapterSize.LARGE)])
     plan = plan_semester(source)
-    assert plan.week_count == 2
-    first, second = [week.chapters[0] for week in plan.weeks]
-    assert (first.part_index, second.part_index) == (1, 2)
-    assert first.end_page + 1 == second.start_page
-    assert first.start_page == 1
-    assert second.end_page == 100
+    assert plan.week_count == 1
+    only = plan.weeks[0].chapters[0]
+    assert (only.start_page, only.end_page) == (1, 100)
     assert plan.validate_against(source) is plan
 
 
@@ -128,11 +129,13 @@ def test_a_week_accepts_compressed_chapters():
     assert len(week.chapters) == MAX_CHAPTERS_PER_WEEK
 
 
-def test_a_course_never_exceeds_the_three_month_ceiling():
-    # 40 one-page chapters would once have produced a 40-week course.
+def test_a_large_course_splits_across_semesters_instead_of_breaking_the_ceiling():
     source = inventory([chapter(index, index, index) for index in range(1, 41)])
     plan = plan_semester(source)
-    assert plan.week_count <= MAX_SEMESTER_WEEKS
+    assert plan.semester_count == 2
+    assert [semester.week_count for semester in plan.semesters] == [12, 12]
+    assert plan.week_count == 24
+    assert all(semester.week_count <= MAX_SEMESTER_WEEKS for semester in plan.semesters)
     covered = sum(len(week.chapters) for week in plan.weeks)
     assert covered == 40, "compression must not drop chapters"
     assert plan.validate_against(source) is plan
@@ -189,4 +192,60 @@ def test_book_without_a_toc_has_an_explicit_low_confidence_fallback():
     found = discover_chapters(pages, "Mystery book")
     assert found.confidence < 0.5
     assert found.warnings
-    assert plan_semester(found).week_count == 2
+    assert plan_semester(found).week_count == 1
+
+
+@pytest.mark.parametrize(
+    ("chapter_count", "semester_weeks", "quiz_counts", "midterm_counts"),
+    [
+        (8, [8], [8], [2]),
+        (12, [8], [8], [2]),
+        (20, [12], [12], [3]),
+        (30, [12, 12], [12, 12], [3, 3]),
+    ],
+)
+def test_canonical_course_shapes(
+    chapter_count: int,
+    semester_weeks: list[int],
+    quiz_counts: list[int],
+    midterm_counts: list[int],
+):
+    source = inventory([chapter(index, index, index) for index in range(1, chapter_count + 1)])
+    plan = plan_semester(source)
+
+    assert plan.chapter_count == chapter_count
+    assert [semester.week_count for semester in plan.semesters] == semester_weeks
+    assert [semester.quiz_count for semester in plan.semesters] == quiz_counts
+    assert [len(semester.midterms) for semester in plan.semesters] == midterm_counts
+    assert all(semester.final_after_week == semester.week_count for semester in plan.semesters)
+    assert sum(len(week.chapters) for week in plan.weeks) == chapter_count
+
+
+def test_slide_deck_agenda_defines_chapters_and_body_bullets_do_not():
+    pages = [
+        (1, "Course Learning Outcomes\n1. Understand the basic principles of the field of"),
+        (
+            2,
+            "Agenda\n1. General introduction.\n2. When Simulation is the Appropriate Tool.\n"
+            "3. When Simulation is Not Appropriate.\n"
+            "4. Advantages and Disadvantages of Simulation.\n5. Areas of Application.",
+        ),
+        (3, "General Intoduction\nA simulation is the imitation of a real system."),
+        (4, "When Simulation is the Appropriate Tool?"),
+        (5, "When it Appropriate?\nTraining\nAnimation"),
+        (6, "When Simulation is NOT the Appropriate Tool?"),
+        (7, "Advantages of Simulation\nNew systems can be tested."),
+        (8, "Disadvantages of Simulation\nModel building needs training."),
+        (9, "Areas of Application\nHealthcare\nNetworks"),
+    ]
+
+    found = discover_chapters(pages, "Modeling and Simulation")
+
+    assert [chapter.title for chapter in found.chapters] == [
+        "General introduction",
+        "When Simulation is the Appropriate Tool",
+        "When Simulation is Not Appropriate",
+        "Advantages and Disadvantages of Simulation",
+        "Areas of Application",
+    ]
+    assert [chapter.start_page for chapter in found.chapters] == [1, 4, 6, 7, 9]

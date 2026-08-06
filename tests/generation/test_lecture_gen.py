@@ -39,6 +39,8 @@ def test_semester_plan_is_saved_for_other_endpoints(tmp_path, monkeypatch):
     )
     assert saved["schema_name"] == "univai.semester.week-plan"
     assert saved["week_count"] == 3
+    assert saved["semester_count"] == 1
+    assert saved["semesters"][0]["quiz_count"] == 3
 
 
 def test_minimum_lecture_batches_all_slides_without_an_impossible_tail(monkeypatch):
@@ -66,11 +68,11 @@ def test_minimum_lecture_batches_all_slides_without_an_impossible_tail(monkeypat
 
     lecture = lecture_gen.generate_week(1, 1, "Chapter 1", pages)
 
-    assert [slides for _, slides, _ in calls] == [7, 6, 6, 6, 6]
+    assert [slides for _, slides, _ in calls] == [10, 10, 9, 9, 9]
     assert [page for batch_pages, _, _ in calls for page in batch_pages] == [1, 2, 3, 4, 5]
     assert [first for _, _, first in calls] == [True, False, False, False, False]
-    assert len(lecture["slides"]) == 31
-    assert lecture["durationMinutes"] == 30
+    assert len(lecture["slides"]) == 47
+    assert lecture["durationMinutes"] == 45
 
 
 def test_short_final_batch_accepts_its_requested_size():
