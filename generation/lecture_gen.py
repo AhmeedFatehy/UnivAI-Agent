@@ -17,12 +17,15 @@ split — the model is never trusted to invent one.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 AGENT_ROOT = Path(__file__).resolve().parents[1]
@@ -150,7 +153,136 @@ QUIZ_SYSTEM = load_prompt_for(PromptOperation.ASSESSMENT_QUIZ).system
 
 def progress(book_id: int, message: str) -> None:
     print(f"[lecture-gen] {message}", flush=True)
-    execute("UPDATE books SET progress = %s WHERE id = %s", (message, book_id))
+    execute(
+        "UPDATE books SET progress = %s, heartbeat_at = CURRENT_TIMESTAMP WHERE id = %s",
+        (message, book_id),
+    )
+
+
+def start_heartbeat(book_id: int) -> None:
+    """Keep long LLM and TTS stages distinguishable from an abandoned run."""
+    def beat() -> None:
+        waiter = threading.Event()
+        while True:
+            try:
+                execute(
+                    "UPDATE books SET heartbeat_at = CURRENT_TIMESTAMP WHERE id = %s",
+                    (book_id,),
+                )
+            except Exception as exc:  # noqa: BLE001 - status reporting must not kill work
+                print(f"[lecture-gen] heartbeat warning: {exc}", flush=True)
+            waiter.wait(15)
+
+    threading.Thread(target=beat, name=f"book-{book_id}-heartbeat", daemon=True).start()
+
+
+def mark_milestone(
+    book_id: int,
+    sid: str,
+    week: int,
+    stage: str,
+    status: str,
+    *,
+    message: str | None = None,
+    error: str | None = None,
+    artifact_ref: str | None = None,
+) -> None:
+    """Upsert one durable checkpoint without disturbing completed siblings."""
+    execute(
+        """
+        INSERT INTO course_generation_milestones
+          (book_id, student_id, week, stage, status, attempt_count, progress,
+           error, artifact_ref, started_at, completed_at, updated_at)
+        VALUES
+          (%s, %s, %s, %s, %s,
+           CASE WHEN %s = 'running' THEN 1 ELSE 0 END,
+           %s, %s, %s,
+           CASE WHEN %s = 'running' THEN CURRENT_TIMESTAMP ELSE NULL END,
+           CASE WHEN %s = 'ready' THEN CURRENT_TIMESTAMP ELSE NULL END,
+           CURRENT_TIMESTAMP)
+        ON CONFLICT (book_id, week, stage) DO UPDATE SET
+          status = EXCLUDED.status,
+          attempt_count = course_generation_milestones.attempt_count
+            + CASE WHEN EXCLUDED.status = 'running' THEN 1 ELSE 0 END,
+          progress = EXCLUDED.progress,
+          error = EXCLUDED.error,
+          artifact_ref = COALESCE(EXCLUDED.artifact_ref, course_generation_milestones.artifact_ref),
+          started_at = CASE WHEN EXCLUDED.status = 'running'
+            THEN CURRENT_TIMESTAMP ELSE course_generation_milestones.started_at END,
+          completed_at = CASE WHEN EXCLUDED.status = 'ready'
+            THEN CURRENT_TIMESTAMP
+            WHEN EXCLUDED.status IN ('running', 'failed') THEN NULL
+            ELSE course_generation_milestones.completed_at END,
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            book_id,
+            sid,
+            week,
+            stage,
+            status,
+            status,
+            message,
+            error,
+            artifact_ref,
+            status,
+            status,
+        ),
+    )
+
+
+def milestone_is_ready(book_id: int, week: int, stage: str) -> bool:
+    row = fetch_one(
+        """SELECT status FROM course_generation_milestones
+           WHERE book_id = %s AND week = %s AND stage = %s""",
+        (book_id, week, stage),
+    )
+    return bool(row and row.get("status") == "ready")
+
+
+def refresh_book_counts(book_id: int) -> tuple[int, int]:
+    row = fetch_one(
+        """
+        WITH core AS (
+          SELECT week
+          FROM course_generation_milestones
+          WHERE book_id = %s AND week > 0
+            AND stage IN ('lecture', 'quiz', 'slides') AND status = 'ready'
+          GROUP BY week
+          HAVING COUNT(DISTINCT stage) = 3
+        ), audio AS (
+          SELECT COUNT(*)::int AS count
+          FROM course_generation_milestones
+          WHERE book_id = %s AND week > 0 AND stage = 'audio' AND status = 'ready'
+        )
+        SELECT (SELECT COUNT(*)::int FROM core) AS core_ready,
+               (SELECT count FROM audio) AS audio_ready
+        """,
+        (book_id, book_id),
+    ) or {"core_ready": 0, "audio_ready": 0}
+    core_ready = int(row.get("core_ready") or 0)
+    audio_ready = int(row.get("audio_ready") or 0)
+    execute(
+        """UPDATE books SET generation_ready_weeks = %s,
+               generation_audio_ready_weeks = %s WHERE id = %s""",
+        (core_ready, audio_ready, book_id),
+    )
+    return core_ready, audio_ready
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------- book text
@@ -567,7 +699,7 @@ def generate_quiz(
 # ---------------------------------------------------------------- writing files
 
 
-def write_week(sid: str, week: int, lecture: dict, quiz: list[dict]) -> None:
+def write_lecture(sid: str, week: int, lecture: dict) -> None:
     # Per-student course layout: lectures/<studentId>/week-N/ (matches the app's
     # lib/lectures.ts and the UnivAI-live worker).
     folder = LECTURES_DIR / sid / f"week-{week}"
@@ -590,7 +722,7 @@ def write_week(sid: str, week: int, lecture: dict, quiz: list[dict]) -> None:
         deck += ["", "---", "", f"# {slide['heading'].strip()}", ""]
         deck += [f"- {bullet.strip()}" for bullet in slide["bullets"]]
         deck += ["", f"<small>Source: p.{slide['page']}</small>"]
-    (folder / "slides.md").write_text("\n".join(deck) + "\n", encoding="utf-8")
+    atomic_write(folder / "slides.md", "\n".join(deck) + "\n")
 
     # Slidev's hash router is 1-based and the title slide is 1: the intro plays
     # there, and slide N of content lives at N+1. This alignment was exactly the
@@ -612,68 +744,100 @@ def write_week(sid: str, week: int, lecture: dict, quiz: list[dict]) -> None:
         "durationMinutes": lecture.get("durationMinutes", LECTURE_MINUTES_MIN),
         "segments": segments,
     }
-    (folder / "script.json").write_text(
-        json.dumps(script, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    atomic_write(
+        folder / "script.json",
+        json.dumps(script, indent=2, ensure_ascii=False) + "\n",
+    )
+    # The full lecture checkpoint lets a retry rebuild the deck without asking
+    # the model again. New narration invalidates any older pre-rendered audio.
+    atomic_write(
+        folder / "lecture.json",
+        json.dumps(lecture, indent=2, ensure_ascii=False) + "\n",
+    )
+    audio_dir = folder / "audio"
+    if audio_dir.is_dir():
+        for old_audio in audio_dir.glob("*.npy"):
+            old_audio.unlink(missing_ok=True)
+        (audio_dir / "meta.json").unlink(missing_ok=True)
+
+
+def write_quiz(sid: str, week: int, title: str, quiz: list[dict]) -> None:
+    folder = LECTURES_DIR / sid / f"week-{week}"
+    atomic_write(
+        folder / "quiz.json",
+        json.dumps(
+            {"week": week, "title": title.strip(), "questions": quiz},
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
     )
 
-    (folder / "quiz.json").write_text(
-        json.dumps({"week": week, "title": title, "questions": quiz}, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
 
-    import hashlib
-    from datetime import datetime, timezone
+def create_artifact(filepath: Path, state: str = "ready") -> str:
+    content_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
+    pipeline_hash = hashlib.sha256(b"lecture_gen").hexdigest()
+    content_key = f"sha256:{content_hash}.pipeline:{pipeline_hash}"
 
-    def create_artifact(filepath, state):
-        content_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
-        pipeline_hash = hashlib.sha256(b"lecture_gen").hexdigest()
-        content_key = f"sha256:{content_hash}.pipeline:{pipeline_hash}"
-        
-        try:
-            execute(
-                """
-                INSERT INTO content_artifacts 
-                (content_key, schema_version, original_sha256, pipeline_fingerprint, state, byte_length, page_count, artifact_checksum, storage_ref, created_at, updated_at)
-                VALUES (%s, 'content-artifact-v1', %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (content_key) DO UPDATE SET storage_ref = EXCLUDED.storage_ref, updated_at = EXCLUDED.updated_at
-                """,
-                (
-                    content_key,
-                    content_hash,
-                    json.dumps({"source": "lecture_gen"}),
-                    state,
-                    len(filepath.read_bytes()),
-                    1,
-                    content_hash,
-                    str(filepath.relative_to(ROOT)),
-                    datetime.now(timezone.utc),
-                    datetime.now(timezone.utc)
-                )
-            )
-        except Exception as e:
-            print(f"Error inserting artifact {filepath}: {e}")
-        return content_key
-
-    if execute is not None:
-        slides_key = create_artifact(folder / "slides.md", "ready")
-        script_key = create_artifact(folder / "script.json", "ready")
-        quiz_key = create_artifact(folder / "quiz.json", "ready")
+    try:
         execute(
             """
-            UPDATE lectures
-            SET script_artifact_key = %s, slides_artifact_key = %s, quiz_artifact_key = %s
-            WHERE student_id = %s AND week = %s
+            INSERT INTO content_artifacts
+            (content_key, schema_version, original_sha256, pipeline_fingerprint, state, byte_length, page_count, artifact_checksum, storage_ref, created_at, updated_at)
+            VALUES (%s, 'content-artifact-v1', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (content_key) DO NOTHING
             """,
-            (script_key, slides_key, quiz_key, sid, week)
+            (
+                content_key,
+                content_hash,
+                json.dumps({"source": "lecture_gen"}),
+                state,
+                len(filepath.read_bytes()),
+                1,
+                content_hash,
+                str(filepath.relative_to(ROOT)),
+                datetime.now(timezone.utc),
+                datetime.now(timezone.utc),
+            ),
         )
+    except Exception as exc:
+        print(f"Error inserting artifact {filepath}: {exc}", flush=True)
+    return content_key
+
+
+def register_week_artifacts(sid: str, week: int) -> None:
+    if execute is None:
+        return
+    folder = LECTURES_DIR / sid / f"week-{week}"
+    slides_key = create_artifact(folder / "slides.md")
+    script_key = create_artifact(folder / "script.json")
+    quiz_key = create_artifact(folder / "quiz.json")
+    execute(
+        """
+        UPDATE lectures
+        SET script_artifact_key = %s, slides_artifact_key = %s, quiz_artifact_key = %s
+        WHERE student_id = %s AND week = %s
+        """,
+        (script_key, slides_key, quiz_key, sid, week),
+    )
+
+
+def write_week(sid: str, week: int, lecture: dict, quiz: list[dict]) -> None:
+    """Compatibility helper used by focused callers; checkpoints write separately."""
+    write_lecture(sid, week, lecture)
+    write_quiz(sid, week, lecture["title"], quiz)
+    register_week_artifacts(sid, week)
 
 
 
-def build_slides(sid: str) -> None:
+def build_slides(sid: str, week: int | None = None) -> None:
     # sid tells the builder to read lectures/<sid>/week-N/slides.md and emit the
     # decks under public/slides/<sid>/week-N/.
+    command = ["node", str(ROOT / "scripts" / "build-slides.mjs"), sid]
+    if week is not None:
+        command.append(f"week-{week}")
     result = subprocess.run(
-        ["node", str(ROOT / "scripts" / "build-slides.mjs"), sid],
+        command,
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -685,12 +849,17 @@ def build_slides(sid: str) -> None:
         raise RuntimeError(f"slidev build failed: {result.stderr[-800:]}")
 
 
-def prerender_voice(sid: str) -> None:
-    """Record the whole lecture to disk (UnivAI-live/prerender_audio.py — the
-    Mouth cave's job) in a subprocess, so the TTS memory returns when done.
-    sid scopes it to this student's lectures/<sid>/week-N/audio/."""
+def prerender_voice(sid: str, week: int, book_id: int, total_weeks: int) -> None:
+    """Record one resumable week in a bounded subprocess."""
     result = subprocess.run(
-        [sys.executable, str(ROOT / "UnivAI-live" / "prerender_audio.py"), sid],
+        [
+            sys.executable,
+            str(ROOT / "UnivAI-live" / "prerender_audio.py"),
+            sid,
+            str(week),
+            str(book_id),
+            str(total_weeks),
+        ],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -701,6 +870,116 @@ def prerender_voice(sid: str) -> None:
     )
     if result.returncode != 0:
         raise RuntimeError(f"voice pre-render failed: {(result.stdout + result.stderr)[-500:]}")
+
+
+GENERATION_MANIFEST = "generation-manifest.json"
+AUDIO_WEEKS_PER_RUN = max(1, int(os.getenv("AUDIO_WEEKS_PER_RUN", "1")))
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def valid_lecture_checkpoint(sid: str, week: int) -> bool:
+    folder = LECTURES_DIR / sid / f"week-{week}"
+    script = _read_json(folder / "script.json")
+    lecture = _read_json(folder / "lecture.json")
+    if not script or not isinstance(script.get("segments"), list) or not script["segments"]:
+        return False
+    if not (folder / "slides.md").is_file():
+        return False
+    # Legacy runs did not retain lecture.json. Their script + slides are still
+    # complete checkpoints; new runs keep the richer file for deck rebuilding.
+    return lecture is None or isinstance(lecture.get("slides"), list)
+
+
+def valid_quiz_checkpoint(sid: str, week: int) -> bool:
+    quiz = _read_json(LECTURES_DIR / sid / f"week-{week}" / "quiz.json")
+    return bool(quiz and isinstance(quiz.get("questions"), list) and quiz["questions"])
+
+
+def valid_slides_checkpoint(sid: str, week: int) -> bool:
+    return (
+        ROOT
+        / "UnivAI-app"
+        / "public"
+        / "slides"
+        / sid
+        / f"week-{week}"
+        / "index.html"
+    ).is_file()
+
+
+def valid_audio_checkpoint(sid: str, week: int) -> bool:
+    audio = LECTURES_DIR / sid / f"week-{week}" / "audio"
+    meta = _read_json(audio / "meta.json")
+    return bool(meta and meta.get("sample_rate") and next(audio.glob("*.npy"), None))
+
+
+def prepare_generation_manifest(
+    sid: str,
+    book_id: int,
+    source_sha256: str,
+    total_weeks: int,
+) -> bool:
+    """Return whether existing files belong to a resumable generation.
+
+    The one-time legacy adoption preserves the files produced before manifests
+    existed. Every subsequent source is protected by its SHA-256 identity.
+    """
+    path = LECTURES_DIR / sid / GENERATION_MANIFEST
+    existing = _read_json(path)
+    matching = bool(existing and existing.get("source_sha256") == source_sha256)
+    legacy = existing is None and any((LECTURES_DIR / sid).glob("week-*/script.json"))
+    atomic_write(
+        path,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "book_id": book_id,
+                "source_sha256": source_sha256,
+                "total_weeks": total_weeks,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    return matching or legacy
+
+
+def initialize_milestones(book_id: int, sid: str, total_weeks: int) -> None:
+    mark_milestone(book_id, sid, 0, "plan", "ready", message="Course plan saved")
+    execute(
+        """
+        INSERT INTO course_generation_milestones
+          (book_id, student_id, week, stage, status, updated_at)
+        SELECT %s, %s, generated_week, stage, 'pending', CURRENT_TIMESTAMP
+        FROM generate_series(1, %s) AS generated_week
+        CROSS JOIN unnest(ARRAY['lecture', 'quiz', 'slides', 'audio']) AS stage
+        ON CONFLICT (book_id, week, stage) DO NOTHING
+        """,
+        (book_id, sid, total_weeks),
+    )
+
+
+def update_book_state(
+    book_id: int,
+    status: str,
+    stage: str,
+    message: str,
+    *,
+    error: str | None = None,
+) -> None:
+    execute(
+        """UPDATE books SET status = %s, generation_stage = %s,
+               progress = %s, error = %s WHERE id = %s""",
+        (status, stage, message, error, book_id),
+    )
 
 
 # ---------------------------------------------------------------- main
@@ -774,10 +1053,16 @@ def main() -> int:
     book_id = int(sys.argv[2])
     quizzes_only = "--quizzes-only" in sys.argv[3:]
 
-    book = fetch_one("SELECT id, student_id, title, filename FROM books WHERE id = %s", (book_id,))
+    book = fetch_one(
+        """SELECT id, student_id, title, filename, status, pages, source_sha256,
+                  generation_total_weeks, generation_ready_weeks
+           FROM books WHERE id = %s""",
+        (book_id,),
+    )
     if not book:
         print(json.dumps({"ok": False, "error": f"no book with id {book_id}"}))
         return 2
+    start_heartbeat(book_id)
     # The owner. Every write below is namespaced to this student (disk + DB).
     sid = book.get("student_id")
     if not sid:
@@ -792,22 +1077,82 @@ def main() -> int:
         flush=True,
     )
 
+    active_week = 0
+    active_stage = "plan"
+    total_weeks = 0
     try:
-        progress(book_id, "Reading the book…")
-        pages = read_pages(pdf_path)
-        execute("UPDATE books SET pages = %s WHERE id = %s", (len(pages), book_id))
-        book_title = book.get("title") or book.get("filename") or pdf_path.stem
-        progress(book_id, "Finding chapters and planning the course…")
-        plan, weeks = build_semester_plan(pages, book_title)
-        total_weeks = plan.week_count
-        write_semester_plan(sid, plan)
-        remove_obsolete_weeks(sid, total_weeks)
+        source_sha256 = file_sha256(pdf_path)
+        saved_manifest = _read_json(LECTURES_DIR / sid / GENERATION_MANIFEST)
+        saved_total = int(book.get("generation_total_weeks") or 0)
+        fast_audio_resume = bool(
+            not quizzes_only
+            and saved_total > 0
+            and int(book.get("generation_ready_weeks") or 0) >= saved_total
+            and book.get("source_sha256") == source_sha256
+            and saved_manifest
+            and saved_manifest.get("source_sha256") == source_sha256
+            and (LECTURES_DIR / sid / "semester-plan.json").is_file()
+        )
+
+        if fast_audio_resume:
+            total_weeks = saved_total
+            page_count = int(book.get("pages") or 0)
+            weeks = []
+            resume_files = True
+            message = f"Reusing {total_weeks} published lecture checkpoints…"
+            update_book_state(book_id, "generating", "resuming", message)
+            progress(book_id, message)
+            initialize_milestones(book_id, sid, total_weeks)
+        else:
+            update_book_state(book_id, "generating", "reading", "Reading the book…")
+            progress(book_id, "Reading the book…")
+            pages = read_pages(pdf_path)
+            page_count = len(pages)
+            execute(
+                "UPDATE books SET pages = %s, source_sha256 = %s WHERE id = %s",
+                (page_count, source_sha256, book_id),
+            )
+            book_title = book.get("title") or book.get("filename") or pdf_path.stem
+            update_book_state(
+                book_id,
+                "generating",
+                "planning",
+                "Finding chapters and planning the course…",
+            )
+            progress(book_id, "Finding chapters and planning the course…")
+            plan, weeks = build_semester_plan(pages, book_title)
+            total_weeks = plan.week_count
+            write_semester_plan(sid, plan)
+            remove_obsolete_weeks(sid, total_weeks)
+            resume_files = prepare_generation_manifest(
+                sid, book_id, source_sha256, total_weeks
+            )
+            execute(
+                """UPDATE books SET generation_total_weeks = %s,
+                       generation_stage = 'content', error = NULL WHERE id = %s""",
+                (total_weeks, book_id),
+            )
+            initialize_milestones(book_id, sid, total_weeks)
 
         if quizzes_only:
             regenerate_quizzes(sid, book_id, weeks)
-            execute(
-                "UPDATE books SET status = 'ready', progress = %s WHERE id = %s",
-                (f"Quizzes rewritten — {total_weeks} weeks.", book_id),
+            for planned_week, _week_pages in weeks:
+                mark_milestone(
+                    book_id,
+                    sid,
+                    planned_week.week,
+                    "quiz",
+                    "ready",
+                    message="Quiz checkpoint rewritten",
+                    artifact_ref=f"lectures/{sid}/week-{planned_week.week}/quiz.json",
+                )
+                register_week_artifacts(sid, planned_week.week)
+            refresh_book_counts(book_id)
+            update_book_state(
+                book_id,
+                "ready",
+                "complete",
+                f"Quizzes rewritten — {total_weeks} weeks.",
             )
             print(json.dumps({"ok": True, "weeks": total_weeks, "quizzes_only": True}))
             return 0
@@ -816,36 +1161,206 @@ def main() -> int:
             week = planned_week.week
             first, last = week_pages[0][0], week_pages[-1][0]
             chapter_titles = "; ".join(part.title for part in planned_week.chapters)
-            progress(book_id, f"Writing lecture {week} of {total_weeks} (pages {first}-{last})…")
-            lecture = generate_week(week, total_weeks, chapter_titles, week_pages)
-            progress(book_id, f"Writing quiz {week} of {total_weeks} — “{lecture['title']}”…")
-            spoken = [{"text": lecture["intro"]}] + [
-                {"text": slide["narration"]} for slide in lecture["slides"]
-            ]
-            quiz = generate_quiz(lecture["title"], spoken, week_pages)
-            write_week(sid, week, lecture, quiz)
+            active_week = week
+            active_stage = "lecture"
+
+            if resume_files and valid_lecture_checkpoint(sid, week):
+                script = _read_json(LECTURES_DIR / sid / f"week-{week}" / "script.json")
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "lecture",
+                    "ready",
+                    message="Reused completed lecture checkpoint",
+                    artifact_ref=f"lectures/{sid}/week-{week}/script.json",
+                )
+            else:
+                message = f"Writing lecture {week} of {total_weeks} (pages {first}-{last})…"
+                progress(book_id, message)
+                mark_milestone(book_id, sid, week, "lecture", "running", message=message)
+                lecture = generate_week(week, total_weeks, chapter_titles, week_pages)
+                write_lecture(sid, week, lecture)
+                script = _read_json(LECTURES_DIR / sid / f"week-{week}" / "script.json")
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "lecture",
+                    "ready",
+                    message="Lecture script saved",
+                    artifact_ref=f"lectures/{sid}/week-{week}/script.json",
+                )
+
+            if not script:
+                raise RuntimeError(f"week {week} lecture checkpoint is unreadable")
+
+            active_stage = "quiz"
+            if resume_files and valid_quiz_checkpoint(sid, week):
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "quiz",
+                    "ready",
+                    message="Reused completed quiz checkpoint",
+                    artifact_ref=f"lectures/{sid}/week-{week}/quiz.json",
+                )
+            else:
+                message = f"Writing quiz {week} of {total_weeks} — “{script['title']}”…"
+                progress(book_id, message)
+                mark_milestone(book_id, sid, week, "quiz", "running", message=message)
+                spoken = [{"text": segment["text"]} for segment in script["segments"]]
+                quiz = generate_quiz(script["title"], spoken, week_pages)
+                write_quiz(sid, week, script["title"], quiz)
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "quiz",
+                    "ready",
+                    message="Quiz saved",
+                    artifact_ref=f"lectures/{sid}/week-{week}/quiz.json",
+                )
+
+            active_stage = "slides"
+            if resume_files and valid_slides_checkpoint(sid, week):
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "slides",
+                    "ready",
+                    message="Reused published slide deck",
+                    artifact_ref=f"UnivAI-app/public/slides/{sid}/week-{week}/index.html",
+                )
+            else:
+                message = f"Publishing lecture {week} of {total_weeks}…"
+                progress(book_id, message)
+                mark_milestone(book_id, sid, week, "slides", "running", message=message)
+                build_slides(sid, week)
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "slides",
+                    "ready",
+                    message="Slide deck published",
+                    artifact_ref=f"UnivAI-app/public/slides/{sid}/week-{week}/index.html",
+                )
+
+            register_week_artifacts(sid, week)
             execute(
                 "UPDATE lectures SET title = %s WHERE week = %s AND student_id = %s",
-                (lecture["title"].strip(), week, sid),
+                (script["title"].strip(), week, sid),
+            )
+            core_ready, audio_ready = refresh_book_counts(book_id)
+            update_book_state(
+                book_id,
+                "generating",
+                "content",
+                f"Published week {week} of {total_weeks} — {core_ready} ready to use.",
             )
 
-        progress(book_id, "Building the slide decks…")
-        build_slides(sid)
+        # Audio is enrichment, not an all-or-nothing gate. Adopt complete legacy
+        # weeks, render at most one new week per run, and defer the rest.
+        rendered_this_run = 0
+        for week in range(1, total_weeks + 1):
+            active_week = week
+            active_stage = "audio"
+            if valid_audio_checkpoint(sid, week):
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "audio",
+                    "ready",
+                    message="Audio checkpoint ready",
+                    artifact_ref=f"lectures/{sid}/week-{week}/audio/meta.json",
+                )
+                refresh_book_counts(book_id)
+                continue
+            if rendered_this_run >= AUDIO_WEEKS_PER_RUN:
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "audio",
+                    "deferred",
+                    message="Queued for a later generation step",
+                )
+                continue
 
-        progress(book_id, "Recording the lecturer's voice…")
-        prerender_voice(sid)
+            message = f"Recording lecture audio {week} of {total_weeks}…"
+            progress(book_id, message)
+            update_book_state(book_id, "generating", "audio", message)
+            mark_milestone(book_id, sid, week, "audio", "running", message=message)
+            prerender_voice(sid, week, book_id, total_weeks)
+            mark_milestone(
+                book_id,
+                sid,
+                week,
+                "audio",
+                "ready",
+                message="Lecture audio ready",
+                artifact_ref=f"lectures/{sid}/week-{week}/audio/meta.json",
+            )
+            refresh_book_counts(book_id)
+            rendered_this_run += 1
 
-        execute(
-            "UPDATE books SET status = 'ready', progress = %s WHERE id = %s",
-            (f"Course ready — {total_weeks} lectures generated from {len(pages)} pages.", book_id),
+        core_ready, audio_ready = refresh_book_counts(book_id)
+        if audio_ready == total_weeks:
+            final_status = "ready"
+            final_stage = "complete"
+            final_message = (
+                f"Course complete — {core_ready}/{total_weeks} lectures and "
+                f"{audio_ready}/{total_weeks} audio tracks ready."
+            )
+        else:
+            final_status = "partial"
+            final_stage = "paused"
+            final_message = (
+                f"Course usable — {core_ready}/{total_weeks} lectures ready; "
+                f"{audio_ready}/{total_weeks} audio tracks ready. Continue when convenient."
+            )
+        update_book_state(book_id, final_status, final_stage, final_message)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "weeks": total_weeks,
+                    "pages": page_count,
+                    "core_ready": core_ready,
+                    "audio_ready": audio_ready,
+                    "complete": final_status == "ready",
+                }
+            )
         )
-        print(json.dumps({"ok": True, "weeks": total_weeks, "pages": len(pages)}))
         return 0
     except Exception as exc:  # noqa: BLE001 - a failed run must land in books.error
         detail = f"{type(exc).__name__}: {exc}"
-        execute(
-            "UPDATE books SET status = 'failed', error = %s, progress = NULL WHERE id = %s",
-            (detail, book_id),
+        if total_weeks:
+            mark_milestone(
+                book_id,
+                sid,
+                active_week,
+                active_stage,
+                "failed",
+                message=f"{active_stage.title()} failed",
+                error=detail,
+            )
+        core_ready, audio_ready = refresh_book_counts(book_id)
+        failed_status = "partial_failed" if core_ready > 0 else "failed"
+        failed_message = (
+            f"Paused after {core_ready}/{total_weeks or '?'} usable lectures; "
+            f"week {active_week} {active_stage} failed. Resume continues from this checkpoint."
+        )
+        update_book_state(
+            book_id,
+            failed_status,
+            active_stage,
+            failed_message,
+            error=detail,
         )
         print(json.dumps({"ok": False, "error": detail}))
         return 1
