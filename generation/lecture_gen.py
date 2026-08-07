@@ -832,9 +832,32 @@ def write_quiz(sid: str, week: int, title: str, quiz: list[dict]) -> None:
     )
 
 
-def create_artifact(filepath: Path, state: str = "ready") -> str:
+def create_artifact(filepath: Path, sid: str, state: str = "ready") -> str:
+    """Register one generated file and return the key that addresses it.
+
+    The key names the OWNER as well as the bytes. It used to be content-address
+    only, which quietly broke the moment two learners held the same course:
+    identical bytes produced an identical key, ``ON CONFLICT DO NOTHING`` kept
+    the first row, and its storage_ref pointed into the FIRST learner's
+    directory. Every later learner had no row of their own, so resolving their
+    script or quiz through this table would have read another learner's files —
+    and readScript feeds the live lecture.
+
+    Deduplicating the bytes is not this table's job; the RAG artifact cache and
+    the hard-linked audio already do that. This table answers only "where is
+    THIS learner's copy", so the owner belongs in the key.
+
+    The owner rides INSIDE the pipeline component rather than as a suffix,
+    because the schema pins the shape from both directions:
+    ``CHECK (content_key ~ '^sha256:[a-f0-9]{64}\\.pipeline:[a-f0-9]{64}$')``
+    rejects an extra segment, and ``UNIQUE (original_sha256,
+    pipeline_fingerprint)`` collides on its own if the fingerprint is a
+    constant. Hashing the owner into the pipeline satisfies both without a
+    migration: one learner's copy is one artifact, produced by the run that
+    was made for them.
+    """
     content_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
-    pipeline_hash = hashlib.sha256(b"lecture_gen").hexdigest()
+    pipeline_hash = hashlib.sha256(f"lecture_gen:{sid}".encode("utf-8")).hexdigest()
     content_key = f"sha256:{content_hash}.pipeline:{pipeline_hash}"
 
     try:
@@ -848,7 +871,7 @@ def create_artifact(filepath: Path, state: str = "ready") -> str:
             (
                 content_key,
                 content_hash,
-                json.dumps({"source": "lecture_gen"}),
+                json.dumps({"source": "lecture_gen", "owner": sid}),
                 state,
                 len(filepath.read_bytes()),
                 1,
@@ -867,9 +890,9 @@ def register_week_artifacts(sid: str, week: int) -> None:
     if execute is None:
         return
     folder = LECTURES_DIR / sid / f"week-{week}"
-    slides_key = create_artifact(folder / "slides.md")
-    script_key = create_artifact(folder / "script.json")
-    quiz_key = create_artifact(folder / "quiz.json")
+    slides_key = create_artifact(folder / "slides.md", sid)
+    script_key = create_artifact(folder / "script.json", sid)
+    quiz_key = create_artifact(folder / "quiz.json", sid)
     execute(
         """
         UPDATE lectures
@@ -1019,10 +1042,52 @@ def prepare_generation_manifest(
     return matching or legacy
 
 
-# Files that make up one reusable week. audio/ is deliberately excluded: it is
-# many megabytes per week, it is regenerable from script.json in minutes, and
-# the resumable pipeline already knows how to record a missing track.
+# The text of one reusable week. Small (68-112 KB), and genuinely copied:
+# every learner owns their files, because a shared directory would let one
+# learner's regenerate rewrite another's course.
 REUSABLE_WEEK_FILES = ("script.json", "slides.md", "quiz.json", "lecture.json")
+
+
+def link_or_copy(source: Path, target: Path) -> None:
+    """Hard-link a file, falling back to a copy when the link cannot be made.
+
+    A link fails across filesystems (EXDEV) and on filesystems without hard
+    links; a copy is always correct, just larger. Either way the caller ends up
+    with a readable file at ``target``.
+    """
+    if target.exists():
+        target.unlink()
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def adopt_week_audio(donor: str, sid: str, week: int) -> bool:
+    """Give this learner the donor's rendered voice without re-rendering it.
+
+    Audio dwarfs everything else — 86 MB a week against ~100 KB of text — so
+    copying it per learner would cost gigabytes across a cohort, and
+    re-rendering it costs ~20 minutes of TTS to produce byte-identical output
+    from the same script and the same engine. Hard links cost neither: one copy
+    on disk, many names for it.
+
+    This is safe because prerender_audio never writes a clip in place. It
+    renders to ``.<name>.tmp.npy`` and calls ``replace()``, which swaps in a NEW
+    inode — so a learner who later regenerates gets their own file and the
+    donor's bytes are untouched. Stale cleanup unlinks, which only drops a name.
+    """
+    source_dir = LECTURES_DIR / donor / f"week-{week}" / "audio"
+    if not valid_audio_checkpoint(donor, week):
+        return False
+    target_dir = LECTURES_DIR / sid / f"week-{week}" / "audio"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for clip in sorted(source_dir.glob("*.npy")):
+        link_or_copy(clip, target_dir / clip.name)
+    meta = source_dir / "meta.json"
+    if meta.is_file():
+        link_or_copy(meta, target_dir / meta.name)
+    return valid_audio_checkpoint(sid, week)
 
 
 def find_reusable_course(
@@ -1090,6 +1155,8 @@ def adopt_course(donor: str, sid: str, total_weeks: int) -> None:
             candidate = source_week / name
             if candidate.is_file():
                 shutil.copy2(candidate, target_week / name)
+        # Any week the donor has already voiced arrives voiced.
+        adopt_week_audio(donor, sid, week)
 
 
 def finish_adopted_course(sid: str, book_id: int, total_weeks: int) -> None:
@@ -1129,14 +1196,27 @@ def finish_adopted_course(sid: str, book_id: int, total_weeks: int) -> None:
             message="Slide deck published",
             artifact_ref=f"UnivAI-app/public/slides/{sid}/week-{week}/index.html",
         )
-        mark_milestone(
-            book_id,
-            sid,
-            week,
-            "audio",
-            "deferred",
-            message="Queued for a later generation step",
-        )
+        # A week the donor had already voiced is ready now; the rest queue for
+        # a later step exactly as a freshly generated course's would.
+        if valid_audio_checkpoint(sid, week):
+            mark_milestone(
+                book_id,
+                sid,
+                week,
+                "audio",
+                "ready",
+                message="Reused lecture audio from an identical book",
+                artifact_ref=f"lectures/{sid}/week-{week}/audio/meta.json",
+            )
+        else:
+            mark_milestone(
+                book_id,
+                sid,
+                week,
+                "audio",
+                "deferred",
+                message="Queued for a later generation step",
+            )
         register_week_artifacts(sid, week)
         title = str(script.get("title") or "").strip()
         if title:
@@ -1147,6 +1227,15 @@ def finish_adopted_course(sid: str, book_id: int, total_weeks: int) -> None:
         refresh_book_counts(book_id)
 
     core_ready, audio_ready = refresh_book_counts(book_id)
+    if audio_ready >= total_weeks:
+        update_book_state(
+            book_id,
+            "ready",
+            "complete",
+            f"Course ready from an identical book — {core_ready}/{total_weeks} lectures "
+            f"and {audio_ready}/{total_weeks} audio tracks.",
+        )
+        return
     update_book_state(
         book_id,
         "partial",
