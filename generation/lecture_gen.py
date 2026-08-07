@@ -832,9 +832,32 @@ def write_quiz(sid: str, week: int, title: str, quiz: list[dict]) -> None:
     )
 
 
-def create_artifact(filepath: Path, state: str = "ready") -> str:
+def create_artifact(filepath: Path, sid: str, state: str = "ready") -> str:
+    """Register one generated file and return the key that addresses it.
+
+    The key names the OWNER as well as the bytes. It used to be content-address
+    only, which quietly broke the moment two learners held the same course:
+    identical bytes produced an identical key, ``ON CONFLICT DO NOTHING`` kept
+    the first row, and its storage_ref pointed into the FIRST learner's
+    directory. Every later learner had no row of their own, so resolving their
+    script or quiz through this table would have read another learner's files —
+    and readScript feeds the live lecture.
+
+    Deduplicating the bytes is not this table's job; the RAG artifact cache and
+    the hard-linked audio already do that. This table answers only "where is
+    THIS learner's copy", so the owner belongs in the key.
+
+    The owner rides INSIDE the pipeline component rather than as a suffix,
+    because the schema pins the shape from both directions:
+    ``CHECK (content_key ~ '^sha256:[a-f0-9]{64}\\.pipeline:[a-f0-9]{64}$')``
+    rejects an extra segment, and ``UNIQUE (original_sha256,
+    pipeline_fingerprint)`` collides on its own if the fingerprint is a
+    constant. Hashing the owner into the pipeline satisfies both without a
+    migration: one learner's copy is one artifact, produced by the run that
+    was made for them.
+    """
     content_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
-    pipeline_hash = hashlib.sha256(b"lecture_gen").hexdigest()
+    pipeline_hash = hashlib.sha256(f"lecture_gen:{sid}".encode("utf-8")).hexdigest()
     content_key = f"sha256:{content_hash}.pipeline:{pipeline_hash}"
 
     try:
@@ -848,7 +871,7 @@ def create_artifact(filepath: Path, state: str = "ready") -> str:
             (
                 content_key,
                 content_hash,
-                json.dumps({"source": "lecture_gen"}),
+                json.dumps({"source": "lecture_gen", "owner": sid}),
                 state,
                 len(filepath.read_bytes()),
                 1,
@@ -867,9 +890,9 @@ def register_week_artifacts(sid: str, week: int) -> None:
     if execute is None:
         return
     folder = LECTURES_DIR / sid / f"week-{week}"
-    slides_key = create_artifact(folder / "slides.md")
-    script_key = create_artifact(folder / "script.json")
-    quiz_key = create_artifact(folder / "quiz.json")
+    slides_key = create_artifact(folder / "slides.md", sid)
+    script_key = create_artifact(folder / "script.json", sid)
+    quiz_key = create_artifact(folder / "quiz.json", sid)
     execute(
         """
         UPDATE lectures
