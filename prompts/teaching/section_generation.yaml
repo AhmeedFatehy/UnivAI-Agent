@@ -1,5 +1,5 @@
 name: teaching/section_generation
-version: "1.0.0"
+version: "1.1.0"
 description: Draft a grounded post-lecture section pack with worked examples and actionable TODOs.
 owner: content
 operations: [content.generate_section]
@@ -28,6 +28,10 @@ system: |
   - A TODO must name one concrete learner action ("rework exercise 2 by hand"),
     never an abstract platitude.
   - Keep the total of activity duration_minutes within the section budget.
+  - A worked example may be a grounded decision, comparison, diagnosis or
+    step-by-step application; it does not need to be a numerical exercise.
+  - When the evidence supports any teachable concept, turn it into at least one
+    concrete cited practice scenario and one concrete cited learner action.
   - If the evidence cannot support a worked example or an actionable TODO,
     return that list empty rather than inventing generic teaching content.
   - Reply with JSON only. No prose, no markdown fences.

@@ -8,6 +8,11 @@ dependencies = [
     # Vector DB & Embeddings
     "qdrant-client[fastembed]>=1.18.0",
     "fastembed>=0.8.0",
+    # Integrated generation also reads PDFs and persists checkpoints through
+    # the parent repository's shared PostgreSQL services.
+    "pypdf>=5.0",
+    "psycopg[binary]>=3.2",
+    "python-dotenv>=1.0",
     # Document Loading & Chunking
     "langchain>=1.3.9",
     "langchain-core>=1.0",

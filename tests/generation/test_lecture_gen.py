@@ -28,37 +28,30 @@ def test_upload_generation_uses_chapter_count_instead_of_four():
     ]
 
 
-def test_semester_plan_is_saved_for_other_endpoints(tmp_path, monkeypatch):
+def test_semester_plan_is_saved_for_other_endpoints(monkeypatch):
     plan, _ = lecture_gen.build_semester_plan(textbook_pages(), "Test book")
-    monkeypatch.setattr(lecture_gen, "LECTURES_DIR", tmp_path)
+    calls = []
+    monkeypatch.setattr(lecture_gen, "execute", lambda sql, params: calls.append((sql, params)))
 
-    lecture_gen.write_semester_plan("student-1", plan)
+    lecture_gen.write_semester_plan("student-1", plan, 7)
 
-    saved = json.loads(
-        (tmp_path / "student-1" / "semester-plan.json").read_text(encoding="utf-8")
-    )
+    saved = json.loads(calls[0][1][0])
+    assert "UPDATE books SET semester_plan" in calls[0][0]
+    assert calls[0][1][1:] == (7, "student-1")
     assert saved["schema_name"] == "univai.semester.week-plan"
     assert saved["week_count"] == 3
     assert saved["semester_count"] == 1
     assert saved["semesters"][0]["quiz_count"] == 3
 
 
-def test_regeneration_removes_only_obsolete_tail_weeks(tmp_path, monkeypatch):
-    lectures = tmp_path / "lectures"
-    slides = tmp_path / "UnivAI-app" / "public" / "slides"
-    monkeypatch.setattr(lecture_gen, "ROOT", tmp_path)
-    monkeypatch.setattr(lecture_gen, "LECTURES_DIR", lectures)
-    for root in (lectures / "student-1", slides / "student-1"):
-        (root / "week-1").mkdir(parents=True)
-        (root / "week-2").mkdir()
-        (root / "notes").mkdir()
+def test_regeneration_removes_only_obsolete_tail_weeks(monkeypatch):
+    calls = []
+    monkeypatch.setattr(lecture_gen, "execute", lambda sql, params: calls.append((sql, params)))
 
-    lecture_gen.remove_obsolete_weeks("student-1", 1)
+    lecture_gen.remove_obsolete_weeks("student-1", 1, 7)
 
-    for root in (lectures / "student-1", slides / "student-1"):
-        assert (root / "week-1").is_dir()
-        assert not (root / "week-2").exists()
-        assert (root / "notes").is_dir()
+    assert "DELETE FROM lecture_artifacts" in calls[0][0]
+    assert calls[0][1] == (7, "student-1", 1)
 
 
 def test_minimum_lecture_batches_all_slides_without_an_impossible_tail(monkeypatch):
@@ -139,30 +132,80 @@ def test_quiz_size_is_derived_per_week_including_quiz_only_regeneration(monkeypa
     ]
 
 
-def test_generation_manifest_resumes_only_the_same_source(tmp_path, monkeypatch):
-    monkeypatch.setattr(lecture_gen, "LECTURES_DIR", tmp_path)
-    week = tmp_path / "student-1" / "week-1"
-    week.mkdir(parents=True)
-    (week / "script.json").write_text('{"segments": [{"text": "ready"}]}', encoding="utf-8")
+def test_generation_manifest_resumes_only_the_same_source(monkeypatch):
+    state = {7: None, 8: None}
+    monkeypatch.setattr(
+        lecture_gen,
+        "fetch_one",
+        lambda _sql, params: {"generation_manifest": state[params[0]]},
+    )
+    def save(_sql, params):
+        state[params[1]] = json.loads(params[0])
+    monkeypatch.setattr(lecture_gen, "execute", save)
 
-    assert lecture_gen.prepare_generation_manifest("student-1", 7, "a" * 64, 3) is True
+    assert lecture_gen.prepare_generation_manifest("student-1", 7, "a" * 64, 3) is False
     assert lecture_gen.prepare_generation_manifest("student-1", 7, "a" * 64, 3) is True
     assert lecture_gen.prepare_generation_manifest("student-1", 8, "b" * 64, 3) is False
 
 
-def test_lecture_checkpoint_survives_without_legacy_full_lecture_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(lecture_gen, "LECTURES_DIR", tmp_path)
-    folder = tmp_path / "student-1" / "week-1"
-    folder.mkdir(parents=True)
-    (folder / "script.json").write_text(
-        json.dumps({"segments": [{"text": "Saved narration"}]}),
-        encoding="utf-8",
-    )
-    (folder / "slides.md").write_text("# Saved deck\n", encoding="utf-8")
-    (folder / "quiz.json").write_text(
-        json.dumps({"questions": [{"stem": "Saved question"}]}),
-        encoding="utf-8",
-    )
+def test_lecture_checkpoint_requires_database_payloads_and_slidev_cache(monkeypatch, tmp_path):
+    cache = tmp_path / "opaque-id"
+    cache.mkdir()
+    (cache / "index.html").write_text("Slidev", encoding="utf-8")
+    monkeypatch.setattr(lecture_gen, "_slidev_cache_dir", lambda _artifact_id: cache)
+    monkeypatch.setattr(lecture_gen, "lecture_artifact", lambda *_args: {
+        "artifact_id": "opaque-id",
+        "script_payload": {"segments": [{"text": "Saved narration"}]},
+        "lecture_payload": {"slides": [{"heading": "Saved"}]},
+        "slides_payload": {"slides": [{"heading": "Saved"}]},
+        "quiz_payload": {"questions": [{"stem": "Saved question"}]},
+    })
 
     assert lecture_gen.valid_lecture_checkpoint("student-1", 1) is True
     assert lecture_gen.valid_quiz_checkpoint("student-1", 1) is True
+    assert lecture_gen.valid_slides_checkpoint("student-1", 1) is True
+
+
+def test_slidev_markdown_is_derived_from_the_database_deck():
+    rendered = lecture_gen._slidev_markdown({
+        "week": 2,
+        "title": "Reliable Systems",
+        "slides": [{
+            "slide": 2,
+            "heading": "Reliability",
+            "bullets": ["Tolerate faults", "Keep serving users"],
+            "page": 17,
+        }],
+    })
+
+    assert "theme: default" in rendered
+    assert "# Reliable Systems" in rendered
+    assert "# Reliability" in rendered
+    assert "- Tolerate faults" in rendered
+    assert "Source: p.17" in rendered
+
+
+def test_lecture_write_lets_postgres_generate_the_public_artifact_id(monkeypatch):
+    calls = []
+    monkeypatch.setattr(lecture_gen, "execute", lambda sql, params: calls.append((sql, params)))
+    lecture = {
+        "title": "Opaque identifiers",
+        "intro": "The database owns public identifiers.",
+        "durationMinutes": 45,
+        "slides": [
+            {
+                "heading": "Database identity",
+                "bullets": ["UUID", "Server generated"],
+                "narration": "PostgreSQL generates an opaque identifier for this lecture artifact.",
+                "page": 4,
+            }
+        ],
+    }
+
+    lecture_gen.write_lecture("student-1", 1, lecture, 7)
+
+    sql, params = calls[0]
+    assert "gen_random_uuid()" in sql
+    assert "INSERT INTO lecture_artifacts" in sql
+    assert params[:4] == (7, "student-1", 1, "Opaque identifiers")
+    assert all("week-1" not in str(value) for value in params)

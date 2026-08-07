@@ -44,10 +44,10 @@ The main repository keeps invoking generation with:
 python UnivAI-Agent/generation/lecture_gen.py <absolute_pdf_path> <book_id>
 ```
 
-Generation first discovers grounded chapter boundaries and writes
-`lectures/<studentId>/semester-plan.json`. Normal chapters take one week,
-adjacent small chapters may share a week (never more than three), and a large
-chapter may take two weeks. The number of weeks is not fixed.
+Generation first discovers grounded chapter boundaries and stores the semester
+plan and every generated week artifact in PostgreSQL. Normal chapters take one
+week, adjacent small chapters may share a week (never more than three), and a
+large chapter may take two weeks. The number of weeks is not fixed.
 
 Set `UNIVAI_INTEGRATION_ROOT` only when the Agent is not located directly
 inside the main checkout. Integrated mode fails clearly if the parent shared

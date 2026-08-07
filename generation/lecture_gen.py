@@ -2,13 +2,10 @@
 
     python UnivAI-Agent/generation/lecture_gen.py <absolute_pdf_path> <book_id>   (from the campus root)
 
-For each week this writes, under lectures/week-N/:
-    slides.md    Slidev deck — title slide + 3 content slides, built from the book
-    script.json  what the Lecturer speaks, aligned slide-by-slide, citing real pages
-    quiz.json    8 MCQs in the exam system's question shape (its question bank)
-
-and then rebuilds the static decks (scripts/build-slides.mjs). Progress is
-reported through books.progress so the upload page can show where it is.
+For each week this stores a structured lecture, narration script, slide deck,
+quiz, and grounded section pack in Postgres. Public identifiers are generated
+by Postgres as UUIDs. Integrated generation never creates learner folders.
+Progress is reported through books.progress so the upload page can show it.
 
 The page numbers on slides and citations are OURS, taken from how the book was
 split — the model is never trusted to invent one.
@@ -24,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,11 +49,13 @@ from planning.semester_planner import (
     plan_semester,
 )
 from generation.course_identity import CourseComponents
+from generation.section_gen import generate_section_pack
+from planning.section_planner import SectionIdentity
+from tools.registry import ToolContext
 
 # The Brain cave is checked out inside the UnivAI campus repo; the shared
 # plumbing (db, LLM adapter) lives there in services/.
 ROOT = Path(__file__).resolve().parents[2]  # the UnivAI campus root
-LECTURES_DIR = ROOT / "lectures"
 execute = None
 fetch_one = None
 fetch_all = None
@@ -65,7 +65,7 @@ LLMError = RuntimeError
 
 def load_integrated_dependencies() -> None:
     """Load parent-owned services only for the explicit integrated command."""
-    global execute, fetch_one, fetch_all, complete, LLMError, ROOT, LECTURES_DIR
+    global execute, fetch_one, fetch_all, complete, LLMError, ROOT
     configured = os.getenv("UNIVAI_INTEGRATION_ROOT")
     ROOT = (
         Path(configured).expanduser().resolve()
@@ -92,7 +92,6 @@ def load_integrated_dependencies() -> None:
     fetch_all = db_fetch_all
     complete = llm_complete
     LLMError = SharedLLMError
-    LECTURES_DIR = Path(os.getenv("LECTURES_DIR", str(ROOT / "lectures"))).resolve()
 
 # ── Lecture length ────────────────────────────────────────────────────
 #
@@ -105,7 +104,7 @@ LECTURE_MINUTES_MIN = 45
 LECTURE_MINUTES_MAX = 120
 # Roughly what a page of textbook is worth once it is spoken rather than read.
 MINUTES_PER_PAGE = 2.0
-# Measured against the pre-rendered Kokoro voice.
+# Measured against the configured narration voice.
 SPOKEN_WORDS_PER_MINUTE = 150
 NARRATION_SENTENCES_PER_SLIDE = 8
 WORDS_PER_NARRATION_SENTENCE = 18
@@ -166,6 +165,7 @@ REPAIR_REPLY_CHARS = 16000
 
 _LECTURE_PROMPT = load_prompt_for(PromptOperation.CONTENT_GENERATE_LECTURE)
 _QUIZ_PROMPT = load_prompt_for(PromptOperation.ASSESSMENT_QUIZ)
+_SECTION_PROMPT = load_prompt_for(PromptOperation.CONTENT_GENERATE_SECTION)
 LECTURE_SYSTEM = _LECTURE_PROMPT.system
 QUIZ_SYSTEM = _QUIZ_PROMPT.system
 
@@ -185,7 +185,10 @@ def course_components() -> CourseComponents:
         narration_sentences_per_slide=NARRATION_SENTENCES_PER_SLIDE,
         slides_per_batch=SLIDES_PER_BATCH,
         min_lecture_questions=MIN_LECTURE_QUESTIONS,
-        prompt_versions=f"lecture={_LECTURE_PROMPT.version},quiz={_QUIZ_PROMPT.version}",
+        prompt_versions=(
+            f"lecture={_LECTURE_PROMPT.version},quiz={_QUIZ_PROMPT.version},"
+            f"section={_SECTION_PROMPT.version}"
+        ),
         # Whichever model actually writes the course. A course written by a
         # weaker model must never be reused for a run configured with a
         # stronger one, so the spec is part of the identity.
@@ -316,13 +319,6 @@ def refresh_book_counts(book_id: int) -> tuple[int, int]:
     return core_ready, audio_ready
 
 
-def atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    temporary.replace(path)
-
-
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -364,38 +360,38 @@ def build_semester_plan(
     return plan, [(week, pages_for_week(week, pages)) for week in plan.weeks]
 
 
-def write_semester_plan(sid: str, plan: SemesterWeekPlan) -> None:
-    folder = LECTURES_DIR / sid
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "semester-plan.json").write_text(
-        plan.model_dump_json(indent=2) + "\n", encoding="utf-8"
-    )
+def write_semester_plan(sid: str, plan: SemesterWeekPlan, book_id: int | None = None) -> None:
+    """Persist the generated plan in Postgres; integrated runs write no course files."""
+    if execute is None:
+        raise RuntimeError("database is not loaded")
+    payload = plan.model_dump_json()
+    if book_id is None:
+        execute(
+            """UPDATE books SET semester_plan = %s::jsonb
+                 WHERE id = (SELECT id FROM books WHERE student_id = %s ORDER BY id DESC LIMIT 1)""",
+            (payload, sid),
+        )
+    else:
+        execute(
+            "UPDATE books SET semester_plan = %s::jsonb WHERE id = %s AND student_id = %s",
+            (payload, book_id, sid),
+        )
 
 
-def remove_obsolete_weeks(sid: str, week_count: int) -> None:
-    """Remove only a regenerated course's now-invalid tail weeks.
-
-    A corrected detector may shorten a plan. Leaving the old folders behind
-    makes slide builds and manual inspection disagree with semester-plan.json.
-    Both roots are resolved and every deletion is containment-checked before
-    it happens; no path outside this student's generated namespace is touched.
-    """
-
-    roots = [
-        (LECTURES_DIR / sid).resolve(),
-        (ROOT / "UnivAI-app" / "public" / "slides" / sid).resolve(),
-    ]
-    for course_root in roots:
-        if not course_root.is_dir():
-            continue
-        for folder in course_root.glob("week-*"):
-            match = re.fullmatch(r"week-(\d+)", folder.name)
-            if not match or int(match.group(1)) <= week_count:
-                continue
-            target = folder.resolve()
-            if course_root not in target.parents:
-                raise RuntimeError(f"refusing to remove week outside {course_root}")
-            shutil.rmtree(target)
+def remove_obsolete_weeks(sid: str, week_count: int, book_id: int | None = None) -> None:
+    """Remove invalid tail artifacts from the database after a shorter re-plan."""
+    if execute is None:
+        return
+    if book_id is None:
+        execute(
+            "DELETE FROM lecture_artifacts WHERE student_id = %s AND week > %s",
+            (sid, week_count),
+        )
+    else:
+        execute(
+            "DELETE FROM lecture_artifacts WHERE book_id = %s AND student_id = %s AND week > %s",
+            (book_id, sid, week_count),
+        )
 
 
 def source_block(pages: list[tuple[int, str]]) -> str:
@@ -754,37 +750,59 @@ def generate_quiz(
     return taught + homework
 
 
-# ---------------------------------------------------------------- writing files
+# ---------------------------------------------------------------- database artifacts
 
 
-def write_lecture(sid: str, week: int, lecture: dict) -> None:
-    # Per-student course layout: lectures/<studentId>/week-N/ (matches the app's
-    # lib/lectures.ts and the UnivAI-live worker).
-    folder = LECTURES_DIR / sid / f"week-{week}"
-    folder.mkdir(parents=True, exist_ok=True)
+def _book_for_student(sid: str, book_id: int | None = None) -> int:
+    if book_id is not None:
+        return book_id
+    row = fetch_one(
+        "SELECT id FROM books WHERE student_id = %s ORDER BY id DESC LIMIT 1",
+        (sid,),
+    )
+    if not row:
+        raise RuntimeError(f"no book found for {sid}")
+    return int(row["id"])
+
+
+def lecture_artifact(sid: str, week: int, book_id: int | None = None) -> dict | None:
+    if fetch_one is None:
+        return None
+    if book_id is None:
+        return fetch_one(
+            """SELECT la.* FROM lecture_artifacts la
+                 JOIN books b ON b.id = la.book_id
+                WHERE la.student_id = %s AND la.week = %s
+                ORDER BY b.id DESC LIMIT 1""",
+            (sid, week),
+        )
+    return fetch_one(
+        "SELECT * FROM lecture_artifacts WHERE book_id = %s AND student_id = %s AND week = %s",
+        (book_id, sid, week),
+    )
+
+
+def write_lecture(
+    sid: str, week: int, lecture: dict, book_id: int | None = None
+) -> None:
+    """Store a complete checkpoint as JSONB under a database-generated UUID."""
+    if execute is None:
+        raise RuntimeError("database is not loaded")
+    resolved_book_id = _book_for_student(sid, book_id)
     title = lecture["title"].strip()
-
-    yaml_title = f"Week {week} — {title}".replace('"', "'")
-    deck = [
-        "---",
-        "theme: default",
-        "routerMode: hash",
-        # quoted: a colon inside an unquoted YAML value kills the whole build
-        f'title: "{yaml_title}"',
-        "---",
-        "",
-        f"# Week {week}",
-        f"## {title}",
-    ]
-    for slide in lecture["slides"]:
-        deck += ["", "---", "", f"# {slide['heading'].strip()}", ""]
-        deck += [f"- {bullet.strip()}" for bullet in slide["bullets"]]
-        deck += ["", f"<small>Source: p.{slide['page']}</small>"]
-    atomic_write(folder / "slides.md", "\n".join(deck) + "\n")
-
-    # Slidev's hash router is 1-based and the title slide is 1: the intro plays
-    # there, and slide N of content lives at N+1. This alignment was exactly the
-    # bug in the premade decks - keep it in one place.
+    slides = {
+        "week": week,
+        "title": title,
+        "slides": [
+            {
+                "slide": index + 2,
+                "heading": slide["heading"].strip(),
+                "bullets": [bullet.strip() for bullet in slide["bullets"]],
+                "page": slide["page"],
+            }
+            for index, slide in enumerate(lecture["slides"])
+        ],
+    }
     segments = [
         {"slide": 1, "text": lecture["intro"].strip(), "citations": [{"page": lecture["slides"][0]["page"]}]}
     ]
@@ -797,208 +815,304 @@ def write_lecture(sid: str, week: int, lecture: dict) -> None:
             }
         )
     script = {
-        "lectureId": f"week-{week}",
         "title": title,
         "durationMinutes": lecture.get("durationMinutes", LECTURE_MINUTES_MIN),
         "segments": segments,
     }
-    atomic_write(
-        folder / "script.json",
-        json.dumps(script, indent=2, ensure_ascii=False) + "\n",
+    execute(
+        """
+        INSERT INTO lecture_artifacts
+          (artifact_id, book_id, student_id, week, title, lecture_payload,
+           script_payload, slides_payload, created_at, updated_at)
+        SELECT generated_id, %s, %s, %s, %s, %s::jsonb,
+               %s::jsonb || jsonb_build_object('lectureId', generated_id::text),
+               %s::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+          FROM (SELECT gen_random_uuid() AS generated_id) generated
+        ON CONFLICT (book_id, week) DO UPDATE SET
+          student_id = EXCLUDED.student_id,
+          title = EXCLUDED.title,
+          lecture_payload = EXCLUDED.lecture_payload,
+          script_payload = (EXCLUDED.script_payload - 'lectureId')
+            || jsonb_build_object('lectureId', lecture_artifacts.artifact_id::text),
+          slides_payload = EXCLUDED.slides_payload,
+          quiz_payload = NULL,
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            resolved_book_id,
+            sid,
+            week,
+            title,
+            json.dumps(lecture, ensure_ascii=False),
+            json.dumps(script, ensure_ascii=False),
+            json.dumps(slides, ensure_ascii=False),
+        ),
     )
-    # The full lecture checkpoint lets a retry rebuild the deck without asking
-    # the model again. New narration invalidates any older pre-rendered audio.
-    atomic_write(
-        folder / "lecture.json",
-        json.dumps(lecture, indent=2, ensure_ascii=False) + "\n",
-    )
-    audio_dir = folder / "audio"
-    if audio_dir.is_dir():
-        for old_audio in audio_dir.glob("*.npy"):
-            old_audio.unlink(missing_ok=True)
-        (audio_dir / "meta.json").unlink(missing_ok=True)
 
 
-def write_quiz(sid: str, week: int, title: str, quiz: list[dict]) -> None:
-    folder = LECTURES_DIR / sid / f"week-{week}"
-    atomic_write(
-        folder / "quiz.json",
-        json.dumps(
-            {"week": week, "title": title.strip(), "questions": quiz},
-            indent=2,
-            ensure_ascii=False,
-        )
-        + "\n",
+def write_quiz(
+    sid: str,
+    week: int,
+    title: str,
+    quiz: list[dict],
+    book_id: int | None = None,
+) -> None:
+    payload = {"week": week, "title": title.strip(), "questions": quiz}
+    execute(
+        """UPDATE lecture_artifacts
+              SET quiz_payload = %s::jsonb, updated_at = CURRENT_TIMESTAMP
+            WHERE book_id = %s AND student_id = %s AND week = %s""",
+        (
+            json.dumps(payload, ensure_ascii=False),
+            _book_for_student(sid, book_id),
+            sid,
+            week,
+        ),
     )
 
 
-def create_artifact(filepath: Path, sid: str, state: str = "ready") -> str:
-    """Register one generated file and return the key that addresses it.
+def generate_and_store_section(
+    sid: str,
+    book_id: int,
+    week: int,
+    lecture_title: str,
+    *,
+    focus: str,
+) -> tuple[str, str | None]:
+    """Generate one grounded section and persist it for the approved plan version.
 
-    The key names the OWNER as well as the bytes. It used to be content-address
-    only, which quietly broke the moment two learners held the same course:
-    identical bytes produced an identical key, ``ON CONFLICT DO NOTHING`` kept
-    the first row, and its storage_ref pointed into the FIRST learner's
-    directory. Every later learner had no row of their own, so resolving their
-    script or quiz through this table would have read another learner's files —
-    and readScript feeds the live lecture.
-
-    Deduplicating the bytes is not this table's job; the RAG artifact cache and
-    the hard-linked audio already do that. This table answers only "where is
-    THIS learner's copy", so the owner belongs in the key.
-
-    The owner rides INSIDE the pipeline component rather than as a suffix,
-    because the schema pins the shape from both directions:
-    ``CHECK (content_key ~ '^sha256:[a-f0-9]{64}\\.pipeline:[a-f0-9]{64}$')``
-    rejects an extra segment, and ``UNIQUE (original_sha256,
-    pipeline_fingerprint)`` collides on its own if the fingerprint is a
-    constant. Hashing the owner into the pipeline satisfies both without a
-    migration: one learner's copy is one artifact, produced by the run that
-    was made for them.
+    A refusal is durable generation state but produces no timetable entry.
     """
-    content_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
-    pipeline_hash = hashlib.sha256(f"lecture_gen:{sid}".encode("utf-8")).hexdigest()
-    content_key = f"sha256:{content_hash}.pipeline:{pipeline_hash}"
+    programme = fetch_one(
+        """SELECT id, name, plan_version, collection_id FROM programmes
+             WHERE student_id = %s AND status = 'approved'
+             ORDER BY id DESC LIMIT 1""",
+        (sid,),
+    )
+    artifact = lecture_artifact(sid, week, book_id)
+    if not programme:
+        return "refused", "No approved programme version exists for this learner."
+    if not artifact:
+        raise RuntimeError("a lecture artifact is required before section generation")
 
-    try:
+    programme_id = str(programme["id"])
+    plan_version = int(programme["plan_version"])
+    topic_id = str(artifact["artifact_id"])
+    identity = SectionIdentity(
+        programme_title=str(programme["name"]),
+        plan_schema="programme-plan-v1",
+        plan_version=str(plan_version),
+        user_id=sid,
+        collection_id=str(programme["collection_id"]),
+        course_id=f"book-{book_id}",
+        week_number=week,
+        topic_id=topic_id,
+        lecture_title=lecture_title,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    run = generate_section_pack(
+        llm=lambda prompt: complete(
+            prompt, system=_SECTION_PROMPT.system, max_tokens=4000
+        ).text,
+        identity=identity,
+        tool_context=ToolContext(),
+        focus=focus,
+        on_call=lambda: progress(book_id, f"Writing grounded section {week}…"),
+    )
+    if run.section is None:
         execute(
-            """
-            INSERT INTO content_artifacts
-            (content_key, schema_version, original_sha256, pipeline_fingerprint, state, byte_length, page_count, artifact_checksum, storage_ref, created_at, updated_at)
-            VALUES (%s, 'content-artifact-v1', %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (content_key) DO NOTHING
-            """,
-            (
-                content_key,
-                content_hash,
-                json.dumps({"source": "lecture_gen", "owner": sid}),
-                state,
-                len(filepath.read_bytes()),
-                1,
-                content_hash,
-                str(filepath.relative_to(ROOT)),
-                datetime.now(timezone.utc),
-                datetime.now(timezone.utc),
-            ),
+            """DELETE FROM section_packs
+                WHERE tenant_id = %s AND programme_id = %s
+                  AND approved_plan_version = %s AND week = %s""",
+            (sid, programme_id, plan_version, week),
         )
-    except Exception as exc:
-        print(f"Error inserting artifact {filepath}: {exc}", flush=True)
-    return content_key
+        reason = run.refusal.reason if run.refusal else "Section grounding refused"
+        return "refused", reason
+
+    payload = run.section.model_dump_json()
+    payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    execute(
+        """
+        INSERT INTO section_packs
+          (schema_version, tenant_id, programme_id, course_id, week, lecture_id,
+           approved_plan_id, approved_plan_version, prompt_id, prompt_version,
+           payload_hash, pack_payload, created_at)
+        VALUES
+          ('section-pack-v1', %s, %s, %s, %s, %s, %s, %s, %s, %s,
+           %s, %s::jsonb, CURRENT_TIMESTAMP)
+        ON CONFLICT (tenant_id, approved_plan_id, approved_plan_version, week)
+        DO UPDATE SET
+          programme_id = EXCLUDED.programme_id,
+          course_id = EXCLUDED.course_id,
+          lecture_id = EXCLUDED.lecture_id,
+          prompt_id = EXCLUDED.prompt_id,
+          prompt_version = EXCLUDED.prompt_version,
+          payload_hash = EXCLUDED.payload_hash,
+          pack_payload = EXCLUDED.pack_payload,
+          created_at = CURRENT_TIMESTAMP
+        """,
+        (
+            sid,
+            programme_id,
+            f"book-{book_id}",
+            week,
+            topic_id,
+            programme_id,
+            plan_version,
+            run.prompt_id,
+            run.prompt_version,
+            payload_hash,
+            payload,
+        ),
+    )
+    return "ready", None
 
 
-def register_week_artifacts(sid: str, week: int) -> None:
+def section_checkpoint(
+    sid: str, book_id: int, week: int
+) -> dict | None:
+    return fetch_one(
+        """SELECT sp.section_pack_id FROM section_packs sp
+             JOIN programmes p ON p.id::text = sp.programme_id
+            WHERE sp.tenant_id = %s AND sp.course_id = %s AND sp.week = %s
+              AND p.status = 'approved'
+              AND sp.approved_plan_version = p.plan_version
+            ORDER BY sp.created_at DESC LIMIT 1""",
+        (sid, f"book-{book_id}", week),
+    )
+
+
+def register_week_artifacts(sid: str, week: int, book_id: int | None = None) -> None:
     if execute is None:
         return
-    folder = LECTURES_DIR / sid / f"week-{week}"
-    slides_key = create_artifact(folder / "slides.md", sid)
-    script_key = create_artifact(folder / "script.json", sid)
-    quiz_key = create_artifact(folder / "quiz.json", sid)
+    resolved_book_id = _book_for_student(sid, book_id)
     execute(
         """
         UPDATE lectures
-        SET script_artifact_key = %s, slides_artifact_key = %s, quiz_artifact_key = %s
+        SET lecture_artifact_id = (
+          SELECT artifact_id FROM lecture_artifacts
+           WHERE book_id = %s AND student_id = %s AND week = %s
+        ), book_id = %s
         WHERE student_id = %s AND week = %s
         """,
-        (script_key, slides_key, quiz_key, sid, week),
+        (resolved_book_id, sid, week, resolved_book_id, sid, week),
     )
 
 
-def write_week(sid: str, week: int, lecture: dict, quiz: list[dict]) -> None:
+def write_week(
+    sid: str, week: int, lecture: dict, quiz: list[dict], book_id: int | None = None
+) -> None:
     """Compatibility helper used by focused callers; checkpoints write separately."""
-    write_lecture(sid, week, lecture)
-    write_quiz(sid, week, lecture["title"], quiz)
-    register_week_artifacts(sid, week)
+    write_lecture(sid, week, lecture, book_id)
+    write_quiz(sid, week, lecture["title"], quiz, book_id)
+    register_week_artifacts(sid, week, book_id)
 
 
 
-def build_slides(sid: str, week: int | None = None) -> None:
-    # sid tells the builder to read lectures/<sid>/week-N/slides.md and emit the
-    # decks under public/slides/<sid>/week-N/.
-    command = ["node", str(ROOT / "scripts" / "build-slides.mjs"), sid]
-    if week is not None:
-        command.append(f"week-{week}")
-    result = subprocess.run(
-        command,
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15 * 60,
+def _slidev_cache_dir(artifact_id: str) -> Path:
+    return ROOT / ".cache" / "slidev" / artifact_id
+
+
+def _slidev_markdown(deck: dict) -> str:
+    """Compile the database deck into Slidev input without making it canonical."""
+    title = str(deck["title"]).strip()
+    pages = [
+        "---\n"
+        "theme: default\n"
+        f"title: {json.dumps(title, ensure_ascii=False)}\n"
+        "transition: slide-left\n"
+        "mdc: true\n"
+        "---\n\n"
+        f"# {title}\n\n"
+        f"Week {int(deck['week'])}\n"
+    ]
+    for slide in deck["slides"]:
+        heading = str(slide["heading"]).strip().replace("\n", " ")
+        bullets = [str(item).strip().replace("\n", " ") for item in slide["bullets"]]
+        body = "\n".join(f"- {bullet}" for bullet in bullets if bullet)
+        pages.append(
+            "---\nlayout: default\n---\n\n"
+            f"# {heading}\n\n{body}\n\n"
+            f"<div class=\"absolute bottom-6 right-8 opacity-60\">Source: p.{int(slide['page'])}</div>\n"
+        )
+    return "\n".join(pages)
+
+
+def build_slides(sid: str, week: int | None = None, book_id: int | None = None) -> None:
+    """Build a disposable Slidev cache from the database-owned slide payload."""
+    if week is None:
+        return
+    row = lecture_artifact(sid, week, book_id)
+    if not row or not row.get("slides_payload"):
+        raise RuntimeError(f"week {week} slide artifact is missing")
+    artifact_id = str(row["artifact_id"])
+    target = _slidev_cache_dir(artifact_id).resolve()
+    cache_root = (ROOT / ".cache" / "slidev").resolve()
+    if cache_root not in target.parents:
+        raise RuntimeError("invalid Slidev cache target")
+    if target.exists():
+        shutil.rmtree(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    executable = ROOT / "node_modules" / ".bin" / (
+        "slidev.cmd" if os.name == "nt" else "slidev"
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"slidev build failed: {result.stderr[-800:]}")
+    if not executable.is_file():
+        raise RuntimeError("Slidev is not installed; run npm install from the UnivAI root")
+    temp_root = ROOT / ".cache"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    # Keep the transient deck under the repository cache so Slidev can resolve
+    # the root-installed theme by walking up to node_modules.
+    with tempfile.TemporaryDirectory(prefix="univai-slidev-", dir=temp_root) as temp_dir:
+        deck_path = Path(temp_dir) / "slides.md"
+        deck_path.write_text(_slidev_markdown(row["slides_payload"]), encoding="utf-8")
+        subprocess.run(
+            [
+                str(executable),
+                "build",
+                str(deck_path),
+                "--out",
+                str(target),
+                "--base",
+                f"/api/presentation/{artifact_id}/",
+            ],
+            cwd=ROOT,
+            check=True,
+        )
 
 
-def prerender_voice(sid: str, week: int, book_id: int, total_weeks: int) -> None:
-    """Record one resumable week in a bounded subprocess."""
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "UnivAI-live" / "prerender_audio.py"),
-            sid,
-            str(week),
-            str(book_id),
-            str(total_weeks),
-        ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30 * 60,
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+def valid_lecture_checkpoint(
+    sid: str, week: int, book_id: int | None = None
+) -> bool:
+    row = lecture_artifact(sid, week, book_id)
+    if not row:
+        return False
+    script = row.get("script_payload")
+    lecture = row.get("lecture_payload")
+    slides = row.get("slides_payload")
+    return bool(
+        isinstance(script, dict)
+        and isinstance(script.get("segments"), list)
+        and script["segments"]
+        and isinstance(lecture, dict)
+        and isinstance(lecture.get("slides"), list)
+        and isinstance(slides, dict)
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"voice pre-render failed: {(result.stdout + result.stderr)[-500:]}")
 
 
-GENERATION_MANIFEST = "generation-manifest.json"
-AUDIO_WEEKS_PER_RUN = max(1, int(os.getenv("AUDIO_WEEKS_PER_RUN", "1")))
-
-
-def _read_json(path: Path) -> dict | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else None
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def valid_lecture_checkpoint(sid: str, week: int) -> bool:
-    folder = LECTURES_DIR / sid / f"week-{week}"
-    script = _read_json(folder / "script.json")
-    lecture = _read_json(folder / "lecture.json")
-    if not script or not isinstance(script.get("segments"), list) or not script["segments"]:
-        return False
-    if not (folder / "slides.md").is_file():
-        return False
-    # Legacy runs did not retain lecture.json. Their script + slides are still
-    # complete checkpoints; new runs keep the richer file for deck rebuilding.
-    return lecture is None or isinstance(lecture.get("slides"), list)
-
-
-def valid_quiz_checkpoint(sid: str, week: int) -> bool:
-    quiz = _read_json(LECTURES_DIR / sid / f"week-{week}" / "quiz.json")
+def valid_quiz_checkpoint(sid: str, week: int, book_id: int | None = None) -> bool:
+    row = lecture_artifact(sid, week, book_id)
+    quiz = row.get("quiz_payload") if row else None
     return bool(quiz and isinstance(quiz.get("questions"), list) and quiz["questions"])
 
 
-def valid_slides_checkpoint(sid: str, week: int) -> bool:
-    return (
-        ROOT
-        / "UnivAI-app"
-        / "public"
-        / "slides"
-        / sid
-        / f"week-{week}"
-        / "index.html"
-    ).is_file()
-
-
-def valid_audio_checkpoint(sid: str, week: int) -> bool:
-    audio = LECTURES_DIR / sid / f"week-{week}" / "audio"
-    meta = _read_json(audio / "meta.json")
-    return bool(meta and meta.get("sample_rate") and next(audio.glob("*.npy"), None))
+def valid_slides_checkpoint(sid: str, week: int, book_id: int | None = None) -> bool:
+    row = lecture_artifact(sid, week, book_id)
+    return bool(
+        row
+        and isinstance(row.get("slides_payload"), dict)
+        and (_slidev_cache_dir(str(row["artifact_id"])) / "index.html").is_file()
+    )
 
 
 def prepare_generation_manifest(
@@ -1008,241 +1122,26 @@ def prepare_generation_manifest(
     total_weeks: int,
     course_fingerprint: str | None = None,
 ) -> bool:
-    """Return whether existing files belong to a resumable generation.
-
-    The one-time legacy adoption preserves the files produced before manifests
-    existed. Every subsequent source is protected by its SHA-256 identity.
-
-    The fingerprint is recorded so another learner's run can decide whether this
-    course is safe to adopt (:func:`find_reusable_course`), but it is
-    deliberately NOT part of the resume test: a learner resuming their own
-    half-built course should keep their completed weeks even after the
-    generator changes. Cross-learner reuse is the strict case, and it demands an
-    exact match.
-    """
-    path = LECTURES_DIR / sid / GENERATION_MANIFEST
-    existing = _read_json(path)
+    """Persist and compare the resumable generation manifest in Postgres."""
+    row = fetch_one(
+        "SELECT generation_manifest FROM books WHERE id = %s AND student_id = %s",
+        (book_id, sid),
+    )
+    existing = row.get("generation_manifest") if row else None
     matching = bool(existing and existing.get("source_sha256") == source_sha256)
-    legacy = existing is None and any((LECTURES_DIR / sid).glob("week-*/script.json"))
-    atomic_write(
-        path,
-        json.dumps(
-            {
-                "schema_version": 2,
-                "book_id": book_id,
-                "source_sha256": source_sha256,
-                "course_fingerprint": course_fingerprint,
-                "total_weeks": total_weeks,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-            indent=2,
-        )
-        + "\n",
+    manifest = {
+        "schema_version": 3,
+        "book_id": book_id,
+        "source_sha256": source_sha256,
+        "course_fingerprint": course_fingerprint,
+        "total_weeks": total_weeks,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    execute(
+        "UPDATE books SET generation_manifest = %s::jsonb WHERE id = %s AND student_id = %s",
+        (json.dumps(manifest), book_id, sid),
     )
-    return matching or legacy
-
-
-# The text of one reusable week. Small (68-112 KB), and genuinely copied:
-# every learner owns their files, because a shared directory would let one
-# learner's regenerate rewrite another's course.
-REUSABLE_WEEK_FILES = ("script.json", "slides.md", "quiz.json", "lecture.json")
-
-
-def link_or_copy(source: Path, target: Path) -> None:
-    """Hard-link a file, falling back to a copy when the link cannot be made.
-
-    A link fails across filesystems (EXDEV) and on filesystems without hard
-    links; a copy is always correct, just larger. Either way the caller ends up
-    with a readable file at ``target``.
-    """
-    if target.exists():
-        target.unlink()
-    try:
-        os.link(source, target)
-    except OSError:
-        shutil.copy2(source, target)
-
-
-def adopt_week_audio(donor: str, sid: str, week: int) -> bool:
-    """Give this learner the donor's rendered voice without re-rendering it.
-
-    Audio dwarfs everything else — 86 MB a week against ~100 KB of text — so
-    copying it per learner would cost gigabytes across a cohort, and
-    re-rendering it costs ~20 minutes of TTS to produce byte-identical output
-    from the same script and the same engine. Hard links cost neither: one copy
-    on disk, many names for it.
-
-    This is safe because prerender_audio never writes a clip in place. It
-    renders to ``.<name>.tmp.npy`` and calls ``replace()``, which swaps in a NEW
-    inode — so a learner who later regenerates gets their own file and the
-    donor's bytes are untouched. Stale cleanup unlinks, which only drops a name.
-    """
-    source_dir = LECTURES_DIR / donor / f"week-{week}" / "audio"
-    if not valid_audio_checkpoint(donor, week):
-        return False
-    target_dir = LECTURES_DIR / sid / f"week-{week}" / "audio"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for clip in sorted(source_dir.glob("*.npy")):
-        link_or_copy(clip, target_dir / clip.name)
-    meta = source_dir / "meta.json"
-    if meta.is_file():
-        link_or_copy(meta, target_dir / meta.name)
-    return valid_audio_checkpoint(sid, week)
-
-
-def find_reusable_course(
-    sid: str, source_sha256: str, course_fingerprint: str
-) -> tuple[str, int] | None:
-    """Another learner's finished course for these exact bytes and generator.
-
-    Returns ``(donor_sid, total_weeks)``, or None when nothing is adoptable.
-    Both halves of the key must match: the bytes, so it is the same book, and
-    the fingerprint, so it was built by the generator running now.
-    """
-    if fetch_all is None:
-        return None
-    owners = fetch_all(
-        """SELECT DISTINCT student_id FROM books
-            WHERE source_sha256 = %s AND student_id <> %s
-              AND status IN ('ready', 'partial')""",
-        (source_sha256, sid),
-    )
-    for owner in owners:
-        donor = owner.get("student_id")
-        if not donor:
-            continue
-        manifest = _read_json(LECTURES_DIR / donor / GENERATION_MANIFEST)
-        if not manifest:
-            continue
-        if manifest.get("source_sha256") != source_sha256:
-            continue
-        if manifest.get("course_fingerprint") != course_fingerprint:
-            continue
-        total = int(manifest.get("total_weeks") or 0)
-        if total < 1:
-            continue
-        # Only adopt a course whose weeks are all actually on disk. A donor
-        # halfway through its own build would hand over gaps.
-        if all(valid_lecture_checkpoint(donor, week) for week in range(1, total + 1)):
-            return donor, total
-    return None
-
-
-def adopt_course(donor: str, sid: str, total_weeks: int) -> None:
-    """Copy a donor's generated weeks into this learner's namespace.
-
-    Every learner keeps their OWN copy rather than sharing a directory: the
-    live lecture, the slide build and the exam sync all read
-    ``lectures/<sid>/``, and a shared path would make one learner's regenerate
-    silently rewrite another's course.
-    """
-    source_root = (LECTURES_DIR / donor).resolve()
-    target_root = (LECTURES_DIR / sid).resolve()
-    if not source_root.is_dir():
-        raise RuntimeError(f"donor course {donor} is not on disk")
-    target_root.mkdir(parents=True, exist_ok=True)
-
-    plan = source_root / "semester-plan.json"
-    if not plan.is_file():
-        raise RuntimeError(f"donor course {donor} has no semester plan")
-    shutil.copy2(plan, target_root / "semester-plan.json")
-
-    for week in range(1, total_weeks + 1):
-        source_week = source_root / f"week-{week}"
-        target_week = target_root / f"week-{week}"
-        target_week.mkdir(parents=True, exist_ok=True)
-        for name in REUSABLE_WEEK_FILES:
-            candidate = source_week / name
-            if candidate.is_file():
-                shutil.copy2(candidate, target_week / name)
-        # Any week the donor has already voiced arrives voiced.
-        adopt_week_audio(donor, sid, week)
-
-
-def finish_adopted_course(sid: str, book_id: int, total_weeks: int) -> None:
-    """Publish an adopted course: decks, artifacts, milestones, final state.
-
-    Everything the model would have produced is already on disk, so only the
-    per-learner work is left. Slides are rebuilt rather than copied because a
-    built deck hard-codes its own ``/slides/<sid>/`` base path, and audio is
-    left for the normal deferred pass — it is regenerable from script.json and
-    a learner is not blocked from attending without it.
-    """
-    for week in range(1, total_weeks + 1):
-        script = _read_json(LECTURES_DIR / sid / f"week-{week}" / "script.json") or {}
-        for stage, note in (("lecture", "Reused lecture"), ("quiz", "Reused quiz")):
-            mark_milestone(
-                book_id,
-                sid,
-                week,
-                stage,
-                "ready",
-                message=f"{note} from an identical book",
-                artifact_ref=(
-                    f"lectures/{sid}/week-{week}/"
-                    f"{'script.json' if stage == 'lecture' else 'quiz.json'}"
-                ),
-            )
-        message = f"Publishing lecture {week} of {total_weeks}…"
-        progress(book_id, message)
-        mark_milestone(book_id, sid, week, "slides", "running", message=message)
-        build_slides(sid, week)
-        mark_milestone(
-            book_id,
-            sid,
-            week,
-            "slides",
-            "ready",
-            message="Slide deck published",
-            artifact_ref=f"UnivAI-app/public/slides/{sid}/week-{week}/index.html",
-        )
-        # A week the donor had already voiced is ready now; the rest queue for
-        # a later step exactly as a freshly generated course's would.
-        if valid_audio_checkpoint(sid, week):
-            mark_milestone(
-                book_id,
-                sid,
-                week,
-                "audio",
-                "ready",
-                message="Reused lecture audio from an identical book",
-                artifact_ref=f"lectures/{sid}/week-{week}/audio/meta.json",
-            )
-        else:
-            mark_milestone(
-                book_id,
-                sid,
-                week,
-                "audio",
-                "deferred",
-                message="Queued for a later generation step",
-            )
-        register_week_artifacts(sid, week)
-        title = str(script.get("title") or "").strip()
-        if title:
-            execute(
-                "UPDATE lectures SET title = %s WHERE week = %s AND student_id = %s",
-                (title, week, sid),
-            )
-        refresh_book_counts(book_id)
-
-    core_ready, audio_ready = refresh_book_counts(book_id)
-    if audio_ready >= total_weeks:
-        update_book_state(
-            book_id,
-            "ready",
-            "complete",
-            f"Course ready from an identical book — {core_ready}/{total_weeks} lectures "
-            f"and {audio_ready}/{total_weeks} audio tracks.",
-        )
-        return
-    update_book_state(
-        book_id,
-        "partial",
-        "paused",
-        f"Course ready from an identical book — {core_ready}/{total_weeks} lectures; "
-        f"{audio_ready}/{total_weeks} audio tracks. Continue when convenient.",
-    )
+    return matching
 
 
 def initialize_milestones(book_id: int, sid: str, total_weeks: int) -> None:
@@ -1253,7 +1152,7 @@ def initialize_milestones(book_id: int, sid: str, total_weeks: int) -> None:
           (book_id, student_id, week, stage, status, updated_at)
         SELECT %s, %s, generated_week, stage, 'pending', CURRENT_TIMESTAMP
         FROM generate_series(1, %s) AS generated_week
-        CROSS JOIN unnest(ARRAY['lecture', 'quiz', 'slides', 'audio']) AS stage
+        CROSS JOIN unnest(ARRAY['lecture', 'quiz', 'slides', 'section', 'audio']) AS stage
         ON CONFLICT (book_id, week, stage) DO NOTHING
         """,
         (book_id, sid, total_weeks),
@@ -1283,24 +1182,17 @@ def regenerate_quizzes(
     book_id: int,
     weeks: list[tuple[SemesterWeek, list[tuple[int, str]]]],
 ) -> None:
-    """Rewrite only quiz.json per week, from the ALREADY generated lecture scripts."""
+    """Rewrite only quiz JSONB per week from the saved lecture scripts."""
     total_weeks = len(weeks)
     for planned_week, week_pages in weeks:
         week = planned_week.week
-        script = json.loads(
-            (LECTURES_DIR / sid / f"week-{week}" / "script.json").read_text("utf-8")
-        )
+        row = lecture_artifact(sid, week, book_id)
+        script = row.get("script_payload") if row else None
+        if not isinstance(script, dict):
+            raise RuntimeError(f"week {week} lecture checkpoint is missing")
         progress(book_id, f"Rewriting quiz {week} of {total_weeks} — “{script['title']}”…")
         quiz = generate_quiz(script["title"], script["segments"], week_pages)
-        (LECTURES_DIR / sid / f"week-{week}" / "quiz.json").write_text(
-            json.dumps(
-                {"week": week, "title": script["title"], "questions": quiz},
-                indent=2,
-                ensure_ascii=False,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        write_quiz(sid, week, script["title"], quiz, book_id)
 
 
 def main() -> int:
@@ -1332,7 +1224,7 @@ def main() -> int:
                     "mode": "standalone",
                     "weeks": run["weeks"],
                     "output": str(output),
-                    "side_effects": "database, Slidev, and voice prerender skipped",
+                    "side_effects": "database and integrated voice services skipped",
                 }
             )
         )
@@ -1358,7 +1250,8 @@ def main() -> int:
 
     book = fetch_one(
         """SELECT id, student_id, title, filename, status, pages, source_sha256,
-                  generation_total_weeks, generation_ready_weeks
+                  generation_total_weeks, generation_ready_weeks,
+                  generation_manifest, semester_plan
            FROM books WHERE id = %s""",
         (book_id,),
     )
@@ -1366,7 +1259,7 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": f"no book with id {book_id}"}))
         return 2
     start_heartbeat(book_id)
-    # The owner. Every write below is namespaced to this student (disk + DB).
+    # The owner. Every database write below is namespaced to this student.
     sid = book.get("student_id")
     if not sid:
         print(json.dumps({"ok": False, "error": f"book {book_id} has no owner (student_id)"}))
@@ -1386,56 +1279,23 @@ def main() -> int:
     try:
         source_sha256 = file_sha256(pdf_path)
         fingerprint = course_components().fingerprint()
-        saved_manifest = _read_json(LECTURES_DIR / sid / GENERATION_MANIFEST)
+        saved_manifest = book.get("generation_manifest")
         saved_total = int(book.get("generation_total_weeks") or 0)
-        fast_audio_resume = bool(
+        published_course_resume = bool(
             not quizzes_only
             and saved_total > 0
             and int(book.get("generation_ready_weeks") or 0) >= saved_total
             and book.get("source_sha256") == source_sha256
             and saved_manifest
             and saved_manifest.get("source_sha256") == source_sha256
-            and (LECTURES_DIR / sid / "semester-plan.json").is_file()
+            and book.get("semester_plan")
         )
 
-        # Someone has already paid for this exact book to be turned into this
-        # exact course. Adopt it instead of spending the model again — the
-        # learner gets their course in seconds rather than half an hour.
-        # Skipped for a resume (this learner already has work in progress) and
-        # for the cheap plan-only pass, which is pure Python anyway.
-        adopted = None
-        if not quizzes_only and not plan_only and not fast_audio_resume:
-            adopted = find_reusable_course(sid, source_sha256, fingerprint)
-
-        if adopted:
-            donor, total_weeks = adopted
-            message = f"Reusing a course already built from this book — {total_weeks} weeks."
-            update_book_state(book_id, "generating", "reusing", message)
-            progress(book_id, message)
-            adopt_course(donor, sid, total_weeks)
-            execute(
-                """UPDATE books SET pages = %s, source_sha256 = %s,
-                       generation_total_weeks = %s, generation_stage = 'content',
-                       error = NULL WHERE id = %s""",
-                (int(book.get("pages") or 0), source_sha256, total_weeks, book_id),
-            )
-            prepare_generation_manifest(
-                sid, book_id, source_sha256, total_weeks, fingerprint
-            )
-            initialize_milestones(book_id, sid, total_weeks)
-            finish_adopted_course(sid, book_id, total_weeks)
-            print(
-                json.dumps(
-                    {"ok": True, "weeks": total_weeks, "reused_from": donor}
-                )
-            )
-            return 0
-
-        if fast_audio_resume:
+        if published_course_resume:
             total_weeks = saved_total
             page_count = int(book.get("pages") or 0)
             weeks = []
-            resume_files = True
+            resume_artifacts = True
             message = f"Reusing {total_weeks} published lecture checkpoints…"
             update_book_state(book_id, "generating", "resuming", message)
             progress(book_id, message)
@@ -1459,9 +1319,9 @@ def main() -> int:
             progress(book_id, "Finding chapters and planning the course…")
             plan, weeks = build_semester_plan(pages, book_title)
             total_weeks = plan.week_count
-            write_semester_plan(sid, plan)
-            remove_obsolete_weeks(sid, total_weeks)
-            resume_files = prepare_generation_manifest(
+            write_semester_plan(sid, plan, book_id)
+            remove_obsolete_weeks(sid, total_weeks, book_id)
+            resume_artifacts = prepare_generation_manifest(
                 sid, book_id, source_sha256, total_weeks, fingerprint
             )
             execute(
@@ -1497,9 +1357,9 @@ def main() -> int:
                     "quiz",
                     "ready",
                     message="Quiz checkpoint rewritten",
-                    artifact_ref=f"lectures/{sid}/week-{planned_week.week}/quiz.json",
+                    artifact_ref=f"db:lecture_artifacts:{book_id}:week:{planned_week.week}:quiz",
                 )
-                register_week_artifacts(sid, planned_week.week)
+                register_week_artifacts(sid, planned_week.week, book_id)
             refresh_book_counts(book_id)
             update_book_state(
                 book_id,
@@ -1517,8 +1377,9 @@ def main() -> int:
             active_week = week
             active_stage = "lecture"
 
-            if resume_files and valid_lecture_checkpoint(sid, week):
-                script = _read_json(LECTURES_DIR / sid / f"week-{week}" / "script.json")
+            if resume_artifacts and valid_lecture_checkpoint(sid, week, book_id):
+                saved = lecture_artifact(sid, week, book_id)
+                script = saved.get("script_payload") if saved else None
                 mark_milestone(
                     book_id,
                     sid,
@@ -1526,15 +1387,16 @@ def main() -> int:
                     "lecture",
                     "ready",
                     message="Reused completed lecture checkpoint",
-                    artifact_ref=f"lectures/{sid}/week-{week}/script.json",
+                    artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}:script",
                 )
             else:
                 message = f"Writing lecture {week} of {total_weeks} (pages {first}-{last})…"
                 progress(book_id, message)
                 mark_milestone(book_id, sid, week, "lecture", "running", message=message)
                 lecture = generate_week(week, total_weeks, chapter_titles, week_pages)
-                write_lecture(sid, week, lecture)
-                script = _read_json(LECTURES_DIR / sid / f"week-{week}" / "script.json")
+                write_lecture(sid, week, lecture, book_id)
+                saved = lecture_artifact(sid, week, book_id)
+                script = saved.get("script_payload") if saved else None
                 mark_milestone(
                     book_id,
                     sid,
@@ -1542,14 +1404,14 @@ def main() -> int:
                     "lecture",
                     "ready",
                     message="Lecture script saved",
-                    artifact_ref=f"lectures/{sid}/week-{week}/script.json",
+                    artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}:script",
                 )
 
             if not script:
                 raise RuntimeError(f"week {week} lecture checkpoint is unreadable")
 
             active_stage = "quiz"
-            if resume_files and valid_quiz_checkpoint(sid, week):
+            if resume_artifacts and valid_quiz_checkpoint(sid, week, book_id):
                 mark_milestone(
                     book_id,
                     sid,
@@ -1557,7 +1419,7 @@ def main() -> int:
                     "quiz",
                     "ready",
                     message="Reused completed quiz checkpoint",
-                    artifact_ref=f"lectures/{sid}/week-{week}/quiz.json",
+                    artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}:quiz",
                 )
             else:
                 message = f"Writing quiz {week} of {total_weeks} — “{script['title']}”…"
@@ -1565,7 +1427,7 @@ def main() -> int:
                 mark_milestone(book_id, sid, week, "quiz", "running", message=message)
                 spoken = [{"text": segment["text"]} for segment in script["segments"]]
                 quiz = generate_quiz(script["title"], spoken, week_pages)
-                write_quiz(sid, week, script["title"], quiz)
+                write_quiz(sid, week, script["title"], quiz, book_id)
                 mark_milestone(
                     book_id,
                     sid,
@@ -1573,11 +1435,54 @@ def main() -> int:
                     "quiz",
                     "ready",
                     message="Quiz saved",
-                    artifact_ref=f"lectures/{sid}/week-{week}/quiz.json",
+                    artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}:quiz",
                 )
 
+            active_stage = "section"
+            if section_checkpoint(sid, book_id, week):
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "section",
+                    "ready",
+                    message="Reused grounded section checkpoint",
+                    artifact_ref=f"db:section_packs:{book_id}:week:{week}",
+                )
+            else:
+                message = f"Writing section {week} of {total_weeks}…"
+                progress(book_id, message)
+                mark_milestone(book_id, sid, week, "section", "running", message=message)
+                section_status, refusal = generate_and_store_section(
+                    sid,
+                    book_id,
+                    week,
+                    script["title"],
+                    focus=f"guided practice and application of {script['title']}",
+                )
+                if section_status == "ready":
+                    mark_milestone(
+                        book_id,
+                        sid,
+                        week,
+                        "section",
+                        "ready",
+                        message="Grounded section saved",
+                        artifact_ref=f"db:section_packs:{book_id}:week:{week}",
+                    )
+                else:
+                    mark_milestone(
+                        book_id,
+                        sid,
+                        week,
+                        "section",
+                        "deferred",
+                        message="No grounded section published",
+                        error=refusal,
+                    )
+
             active_stage = "slides"
-            if resume_files and valid_slides_checkpoint(sid, week):
+            if resume_artifacts and valid_slides_checkpoint(sid, week, book_id):
                 mark_milestone(
                     book_id,
                     sid,
@@ -1585,13 +1490,13 @@ def main() -> int:
                     "slides",
                     "ready",
                     message="Reused published slide deck",
-                    artifact_ref=f"UnivAI-app/public/slides/{sid}/week-{week}/index.html",
+                    artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}:slides",
                 )
             else:
                 message = f"Publishing lecture {week} of {total_weeks}…"
                 progress(book_id, message)
                 mark_milestone(book_id, sid, week, "slides", "running", message=message)
-                build_slides(sid, week)
+                build_slides(sid, week, book_id)
                 mark_milestone(
                     book_id,
                     sid,
@@ -1599,10 +1504,10 @@ def main() -> int:
                     "slides",
                     "ready",
                     message="Slide deck published",
-                    artifact_ref=f"UnivAI-app/public/slides/{sid}/week-{week}/index.html",
+                    artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}:slides",
                 )
 
-            register_week_artifacts(sid, week)
+            register_week_artifacts(sid, week, book_id)
             execute(
                 "UPDATE lectures SET title = %s WHERE week = %s AND student_id = %s",
                 (script["title"].strip(), week, sid),
@@ -1615,51 +1520,21 @@ def main() -> int:
                 f"Published week {week} of {total_weeks} — {core_ready} ready to use.",
             )
 
-        # Audio is enrichment, not an all-or-nothing gate. Adopt complete legacy
-        # weeks, render at most one new week per run, and defer the rest.
-        rendered_this_run = 0
+        # Live synthesizes narration from the database script. Readiness means
+        # the on-demand path is available; no per-learner audio folder is built.
         for week in range(1, total_weeks + 1):
             active_week = week
             active_stage = "audio"
-            if valid_audio_checkpoint(sid, week):
-                mark_milestone(
-                    book_id,
-                    sid,
-                    week,
-                    "audio",
-                    "ready",
-                    message="Audio checkpoint ready",
-                    artifact_ref=f"lectures/{sid}/week-{week}/audio/meta.json",
-                )
-                refresh_book_counts(book_id)
-                continue
-            if rendered_this_run >= AUDIO_WEEKS_PER_RUN:
-                mark_milestone(
-                    book_id,
-                    sid,
-                    week,
-                    "audio",
-                    "deferred",
-                    message="Queued for a later generation step",
-                )
-                continue
-
-            message = f"Recording lecture audio {week} of {total_weeks}…"
-            progress(book_id, message)
-            update_book_state(book_id, "generating", "audio", message)
-            mark_milestone(book_id, sid, week, "audio", "running", message=message)
-            prerender_voice(sid, week, book_id, total_weeks)
             mark_milestone(
                 book_id,
                 sid,
                 week,
                 "audio",
                 "ready",
-                message="Lecture audio ready",
-                artifact_ref=f"lectures/{sid}/week-{week}/audio/meta.json",
+                message="On-demand lecture voice ready",
+                artifact_ref="runtime:live-tts",
             )
             refresh_book_counts(book_id)
-            rendered_this_run += 1
 
         core_ready, audio_ready = refresh_book_counts(book_id)
         if audio_ready == total_weeks:
@@ -1667,14 +1542,14 @@ def main() -> int:
             final_stage = "complete"
             final_message = (
                 f"Course complete — {core_ready}/{total_weeks} lectures and "
-                f"{audio_ready}/{total_weeks} audio tracks ready."
+                f"{audio_ready}/{total_weeks} narration runtimes ready."
             )
         else:
             final_status = "partial"
             final_stage = "paused"
             final_message = (
                 f"Course usable — {core_ready}/{total_weeks} lectures ready; "
-                f"{audio_ready}/{total_weeks} audio tracks ready. Continue when convenient."
+                f"{audio_ready}/{total_weeks} narration runtimes ready. Continue when convenient."
             )
         update_book_state(book_id, final_status, final_stage, final_message)
         print(

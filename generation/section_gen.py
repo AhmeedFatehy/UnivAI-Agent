@@ -190,6 +190,39 @@ def generate_section_pack(
     )
 
     refusal = grounded_content_refusal(draft, reason=focus)
+    # A grounded retrieval can still receive an over-cautious first draft with
+    # empty practice lists. Spend the same single repair budget on asking the
+    # model to re-check the supplied passages before treating that as a durable
+    # refusal. This never relaxes citation validation or invents fallback data.
+    if refusal is not None and repair_attempts > 0 and calls[0] == 1:
+        repair_prompt = repair_template.render(
+            original_prompt=prompt,
+            previous_reply=draft.model_dump_json()[:2000],
+            validation_errors=refusal.reason,
+            revision_guidance=(
+                "The retrieval is grounded. Re-check whether the evidence supports "
+                "an applied reasoning scenario and a concrete learner action. If it "
+                "does, include at least one cited worked example and one cited TODO; "
+                "if it truly does not, keep the unsupported list empty."
+            ),
+        )
+        try:
+            repaired_draft = _generate_section_draft(
+                llm,
+                repair_prompt,
+                repair_template,
+                repair_attempts=0,
+                on_call=_count_call,
+                prompts=prompts,
+            )
+        except SectionGenerationError:
+            # The first response was structurally valid and already gave us a
+            # safe refusal. A malformed optional reconsideration must not turn
+            # that safe outcome into a failed course-generation job.
+            pass
+        else:
+            draft = repaired_draft
+            refusal = grounded_content_refusal(draft, reason=focus)
     if refusal is not None:
         return SectionRun(
             outcome=SectionOutcome(refusal=refusal),

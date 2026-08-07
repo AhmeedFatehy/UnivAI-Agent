@@ -141,12 +141,22 @@ def test_a_reply_that_stays_malformed_fails_explicitly(retriever):
 
 
 def test_empty_content_produces_a_refusal_not_a_section(retriever):
-    llm = scripted(**{SECTION_MARKER: [EMPTY_SECTION_JSON]})
+    llm = scripted(**{SECTION_MARKER: [EMPTY_SECTION_JSON, EMPTY_SECTION_JSON]})
     run = run_section(llm, retriever)
 
     assert run.section is None
     assert run.refusal is not None
     assert "no worked example" in run.refusal.reason.lower() or "no section" in run.refusal.reason.lower()
+    assert run.llm_calls == 2
+
+
+def test_empty_grounded_draft_gets_one_semantic_repair(retriever):
+    llm = scripted(**{SECTION_MARKER: [EMPTY_SECTION_JSON, SECTION_JSON]})
+    run = run_section(llm, retriever)
+
+    assert run.section is not None
+    assert run.refusal is None
+    assert run.llm_calls == 2
 
 
 def test_a_fabricated_citation_is_refused_not_published(retriever):
