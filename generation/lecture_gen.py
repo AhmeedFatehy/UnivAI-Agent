@@ -1019,10 +1019,52 @@ def prepare_generation_manifest(
     return matching or legacy
 
 
-# Files that make up one reusable week. audio/ is deliberately excluded: it is
-# many megabytes per week, it is regenerable from script.json in minutes, and
-# the resumable pipeline already knows how to record a missing track.
+# The text of one reusable week. Small (68-112 KB), and genuinely copied:
+# every learner owns their files, because a shared directory would let one
+# learner's regenerate rewrite another's course.
 REUSABLE_WEEK_FILES = ("script.json", "slides.md", "quiz.json", "lecture.json")
+
+
+def link_or_copy(source: Path, target: Path) -> None:
+    """Hard-link a file, falling back to a copy when the link cannot be made.
+
+    A link fails across filesystems (EXDEV) and on filesystems without hard
+    links; a copy is always correct, just larger. Either way the caller ends up
+    with a readable file at ``target``.
+    """
+    if target.exists():
+        target.unlink()
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def adopt_week_audio(donor: str, sid: str, week: int) -> bool:
+    """Give this learner the donor's rendered voice without re-rendering it.
+
+    Audio dwarfs everything else — 86 MB a week against ~100 KB of text — so
+    copying it per learner would cost gigabytes across a cohort, and
+    re-rendering it costs ~20 minutes of TTS to produce byte-identical output
+    from the same script and the same engine. Hard links cost neither: one copy
+    on disk, many names for it.
+
+    This is safe because prerender_audio never writes a clip in place. It
+    renders to ``.<name>.tmp.npy`` and calls ``replace()``, which swaps in a NEW
+    inode — so a learner who later regenerates gets their own file and the
+    donor's bytes are untouched. Stale cleanup unlinks, which only drops a name.
+    """
+    source_dir = LECTURES_DIR / donor / f"week-{week}" / "audio"
+    if not valid_audio_checkpoint(donor, week):
+        return False
+    target_dir = LECTURES_DIR / sid / f"week-{week}" / "audio"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for clip in sorted(source_dir.glob("*.npy")):
+        link_or_copy(clip, target_dir / clip.name)
+    meta = source_dir / "meta.json"
+    if meta.is_file():
+        link_or_copy(meta, target_dir / meta.name)
+    return valid_audio_checkpoint(sid, week)
 
 
 def find_reusable_course(
@@ -1090,6 +1132,8 @@ def adopt_course(donor: str, sid: str, total_weeks: int) -> None:
             candidate = source_week / name
             if candidate.is_file():
                 shutil.copy2(candidate, target_week / name)
+        # Any week the donor has already voiced arrives voiced.
+        adopt_week_audio(donor, sid, week)
 
 
 def finish_adopted_course(sid: str, book_id: int, total_weeks: int) -> None:
@@ -1129,14 +1173,27 @@ def finish_adopted_course(sid: str, book_id: int, total_weeks: int) -> None:
             message="Slide deck published",
             artifact_ref=f"UnivAI-app/public/slides/{sid}/week-{week}/index.html",
         )
-        mark_milestone(
-            book_id,
-            sid,
-            week,
-            "audio",
-            "deferred",
-            message="Queued for a later generation step",
-        )
+        # A week the donor had already voiced is ready now; the rest queue for
+        # a later step exactly as a freshly generated course's would.
+        if valid_audio_checkpoint(sid, week):
+            mark_milestone(
+                book_id,
+                sid,
+                week,
+                "audio",
+                "ready",
+                message="Reused lecture audio from an identical book",
+                artifact_ref=f"lectures/{sid}/week-{week}/audio/meta.json",
+            )
+        else:
+            mark_milestone(
+                book_id,
+                sid,
+                week,
+                "audio",
+                "deferred",
+                message="Queued for a later generation step",
+            )
         register_week_artifacts(sid, week)
         title = str(script.get("title") or "").strip()
         if title:
@@ -1147,6 +1204,15 @@ def finish_adopted_course(sid: str, book_id: int, total_weeks: int) -> None:
         refresh_book_counts(book_id)
 
     core_ready, audio_ready = refresh_book_counts(book_id)
+    if audio_ready >= total_weeks:
+        update_book_state(
+            book_id,
+            "ready",
+            "complete",
+            f"Course ready from an identical book — {core_ready}/{total_weeks} lectures "
+            f"and {audio_ready}/{total_weeks} audio tracks.",
+        )
+        return
     update_book_state(
         book_id,
         "partial",
