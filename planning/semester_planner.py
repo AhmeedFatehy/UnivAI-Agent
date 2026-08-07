@@ -301,9 +301,19 @@ _CHAPTER_RE = re.compile(
 _NUMBERED_HEADING_RE = re.compile(
     r"^\s*(?P<number>\d{1,3})[.:\-]\s+(?P<title>[A-Z][^.!?]{2,90})\s*$"
 )
-_CONTENTS_HEADING_RE = re.compile(r"^(contents|table of contents)$", re.I)
+# Lecture decks rarely title the page a bare "Contents": they qualify it with
+# the session ("Day 3 Contents", "Lecture 2 Contents", "Course Contents"). A few
+# leading words are allowed, but "Agenda" deliberately stays out — an agenda
+# lists the beats of ONE lecture, not the chapters of a book, and splitting on
+# it would shatter a single deck into a semester.
+_CONTENTS_HEADING_RE = re.compile(
+    r"^(?:\S+\s+){0,3}(?:table\s+of\s+)?contents\s*:?$", re.I
+)
+# Entries are numbered ("1. Transactions") or bulleted ("• Transactions");
+# decks overwhelmingly use bullets. An unnumbered entry keeps its position as
+# its number, which is only ever a fallback title.
 _CONTENTS_ITEM_RE = re.compile(
-    r"^\s*(?P<number>\d{1,3})[.)]\s+(?P<title>.+?)\s*[.]?\s*$"
+    r"^\s*(?:(?P<number>\d{1,3})[.)]|[•·▪◦*\-–—])\s+(?P<title>.+?)\s*[.]?\s*$"
 )
 _HEADING_STOP_WORDS = {"a", "an", "and", "for", "is", "of", "the", "to", "when"}
 
@@ -348,7 +358,10 @@ def _contents_chapter_candidates(
             match = _CONTENTS_ITEM_RE.match(line)
             if match:
                 agenda_items.append(
-                    (match.group("number"), match.group("title").strip(" .:-–—"))
+                    (
+                        match.group("number") or str(len(agenda_items) + 1),
+                        match.group("title").strip(" .:-–—"),
+                    )
                 )
         if len(agenda_items) < 2:
             continue

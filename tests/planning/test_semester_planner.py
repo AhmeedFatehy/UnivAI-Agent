@@ -247,6 +247,31 @@ def test_slide_deck_agenda_stays_inside_one_lecture_and_body_bullets_do_not_spli
     assert found.confidence < 0.5
 
 
+def test_a_qualified_bulleted_contents_page_defines_chapters():
+    # A lecture deck's real shape: the contents page is titled for the session
+    # ("Day 3 Contents") and its entries are bulleted, not numbered. Rejecting
+    # either used to collapse the whole deck into one chapter, which turned a
+    # multi-week course into a single hours-long lecture.
+    pages = [
+        (1, "DAY 3"),
+        (2, "Day 3 Contents\n• Transactions\n• Built in functions\n• Triggers"),
+        (3, "Transactions\nA transaction is a set of SQL statements."),
+        (15, "Built in functions\nMySQL ships with many functions."),
+        (30, "Triggers\nA trigger fires on a table event."),
+    ]
+
+    found = discover_chapters(pages, "MySQL")
+
+    assert [chapter.title for chapter in found.chapters] == [
+        "Transactions",
+        "Built in functions",
+        "Triggers",
+    ]
+    assert [chapter.start_page for chapter in found.chapters] == [1, 15, 30]
+    assert found.confidence > 0.5
+    assert plan_semester(found).week_count == 3
+
+
 def test_explicit_contents_entries_can_define_unlabelled_chapters():
     pages = [
         (1, "Table of Contents\n1. Foundations\n2. Advanced Systems"),
