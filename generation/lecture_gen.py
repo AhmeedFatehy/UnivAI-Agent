@@ -39,12 +39,18 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from agents.prompts import PromptOperation, load_prompt_for
 from planning.semester_planner import (
+    MAX_CHAPTERS_PER_SEMESTER,
+    MAX_CHAPTERS_PER_WEEK,
+    MAX_SEMESTER_WEEKS,
+    NORMAL_SEMESTER_CHAPTERS,
+    TARGET_SEMESTER_WEEKS,
     SemesterWeek,
     SemesterWeekPlan,
     discover_chapters,
     pages_for_week,
     plan_semester,
 )
+from generation.course_identity import CourseComponents
 
 # The Brain cave is checked out inside the UnivAI campus repo; the shared
 # plumbing (db, LLM adapter) lives there in services/.
@@ -52,13 +58,14 @@ ROOT = Path(__file__).resolve().parents[2]  # the UnivAI campus root
 LECTURES_DIR = ROOT / "lectures"
 execute = None
 fetch_one = None
+fetch_all = None
 complete = None
 LLMError = RuntimeError
 
 
 def load_integrated_dependencies() -> None:
     """Load parent-owned services only for the explicit integrated command."""
-    global execute, fetch_one, complete, LLMError, ROOT, LECTURES_DIR
+    global execute, fetch_one, fetch_all, complete, LLMError, ROOT, LECTURES_DIR
     configured = os.getenv("UNIVAI_INTEGRATION_ROOT")
     ROOT = (
         Path(configured).expanduser().resolve()
@@ -73,11 +80,16 @@ def load_integrated_dependencies() -> None:
         )
     sys.path.insert(0, str(services))
     sys.path.insert(0, str(ROOT))
-    from common.db import execute as db_execute, fetch_one as db_fetch_one
+    from common.db import (
+        execute as db_execute,
+        fetch_all as db_fetch_all,
+        fetch_one as db_fetch_one,
+    )
     from common.llm import LLMError as SharedLLMError, complete as llm_complete
 
     execute = db_execute
     fetch_one = db_fetch_one
+    fetch_all = db_fetch_all
     complete = llm_complete
     LLMError = SharedLLMError
     LECTURES_DIR = Path(os.getenv("LECTURES_DIR", str(ROOT / "lectures"))).resolve()
@@ -146,9 +158,43 @@ def lecture_shape(page_count: int) -> dict:
 MAX_SOURCE_CHARS = 12000
 MAX_CHARS_PER_PAGE = 1500
 ATTEMPTS = 4
+# How much of a rejected reply the repair prompt shows back to the model. A
+# slide batch is allowed 800 + 340 * slides tokens — roughly 11k characters at
+# SLIDES_PER_BATCH — so the old 2000-char excerpt cut off before the later
+# slides. Asked to fix slide 5, the model could not see slide 5.
+REPAIR_REPLY_CHARS = 16000
 
-LECTURE_SYSTEM = load_prompt_for(PromptOperation.CONTENT_GENERATE_LECTURE).system
-QUIZ_SYSTEM = load_prompt_for(PromptOperation.ASSESSMENT_QUIZ).system
+_LECTURE_PROMPT = load_prompt_for(PromptOperation.CONTENT_GENERATE_LECTURE)
+_QUIZ_PROMPT = load_prompt_for(PromptOperation.ASSESSMENT_QUIZ)
+LECTURE_SYSTEM = _LECTURE_PROMPT.system
+QUIZ_SYSTEM = _QUIZ_PROMPT.system
+
+
+def course_components() -> CourseComponents:
+    """The live inputs that decide what a book becomes, read at call time."""
+    return CourseComponents(
+        target_semester_weeks=TARGET_SEMESTER_WEEKS,
+        max_semester_weeks=MAX_SEMESTER_WEEKS,
+        normal_semester_chapters=NORMAL_SEMESTER_CHAPTERS,
+        max_chapters_per_semester=MAX_CHAPTERS_PER_SEMESTER,
+        max_chapters_per_week=MAX_CHAPTERS_PER_WEEK,
+        lecture_minutes_min=LECTURE_MINUTES_MIN,
+        lecture_minutes_max=LECTURE_MINUTES_MAX,
+        minutes_per_page=MINUTES_PER_PAGE,
+        spoken_words_per_minute=SPOKEN_WORDS_PER_MINUTE,
+        narration_sentences_per_slide=NARRATION_SENTENCES_PER_SLIDE,
+        slides_per_batch=SLIDES_PER_BATCH,
+        min_lecture_questions=MIN_LECTURE_QUESTIONS,
+        prompt_versions=f"lecture={_LECTURE_PROMPT.version},quiz={_QUIZ_PROMPT.version}",
+        # Whichever model actually writes the course. A course written by a
+        # weaker model must never be reused for a run configured with a
+        # stronger one, so the spec is part of the identity.
+        generation_model=(
+            os.getenv("LLM_GENERATION", "").strip()
+            or os.getenv("LLM_PRIMARY", "").strip()
+            or "unset"
+        ),
+    )
 
 
 def progress(book_id: int, message: str) -> None:
@@ -430,7 +476,7 @@ def ask_json(prompt: str, system: str, max_tokens: int, check) -> dict:
         print(f"[lecture-gen]   reply ended: {result.text[-200:]!r}", flush=True)
         current_prompt = repair_template.render(
             original_prompt=prompt,
-            previous_reply=result.text[:2000],
+            previous_reply=result.text[:REPAIR_REPLY_CHARS],
             validation_errors=problem,
             json_schema="Use the exact JSON shape and rules in the original prompt.",
         )
@@ -453,18 +499,30 @@ def check_lecture(
     minimum = max(1, expected - 2)
     if not isinstance(slides, list) or len(slides) < minimum:
         return f"need at least {minimum} slides"
-    for slide in slides[:expected]:
-        if not isinstance(slide.get("heading"), str) or not slide["heading"].strip():
-            return "a slide is missing its heading"
+    # Name the offending slide. This string is handed straight back to the model
+    # as the repair instruction (ask_json -> validation_errors), and a batch is
+    # rejected whole even when a single slide is short, so "each slide needs..."
+    # told it nothing about WHICH slide to fix — every retry reproduced the same
+    # fault and the week died after ATTEMPTS identical rejections.
+    for position, slide in enumerate(slides[:expected], start=1):
+        heading = slide.get("heading")
+        if not isinstance(heading, str) or not heading.strip():
+            return f"slide {position} is missing its heading"
+        where = f"slide {position} ({heading.strip()!r})"
         bullets = slide.get("bullets")
         if not isinstance(bullets, list) or not any(
             isinstance(b, str) and b.strip() for b in bullets
         ):
-            return "each slide needs at least one bullet"
-        if not isinstance(slide.get("narration"), str) or len(slide["narration"].split()) < 15:
-            return "each slide needs spoken narration of at least 15 words"
+            return f"{where} needs at least one bullet"
+        narration = slide.get("narration")
+        spoken = len(narration.split()) if isinstance(narration, str) else 0
+        if spoken < 15:
+            return (
+                f"{where} has {spoken}-word narration; rewrite only that slide's "
+                "narration so it is at least 15 spoken words. Leave the others as they are."
+            )
         if not isinstance(slide.get("page"), int):
-            return "each slide needs the page number it came from"
+            return f"{where} needs the page number it came from"
     # Only the opening batch introduces the lecture; the ones that continue it
     # are told to leave intro empty so the lecturer does not greet the room
     # again halfway through.
@@ -925,11 +983,19 @@ def prepare_generation_manifest(
     book_id: int,
     source_sha256: str,
     total_weeks: int,
+    course_fingerprint: str | None = None,
 ) -> bool:
     """Return whether existing files belong to a resumable generation.
 
     The one-time legacy adoption preserves the files produced before manifests
     existed. Every subsequent source is protected by its SHA-256 identity.
+
+    The fingerprint is recorded so another learner's run can decide whether this
+    course is safe to adopt (:func:`find_reusable_course`), but it is
+    deliberately NOT part of the resume test: a learner resuming their own
+    half-built course should keep their completed weeks even after the
+    generator changes. Cross-learner reuse is the strict case, and it demands an
+    exact match.
     """
     path = LECTURES_DIR / sid / GENERATION_MANIFEST
     existing = _read_json(path)
@@ -939,9 +1005,10 @@ def prepare_generation_manifest(
         path,
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "book_id": book_id,
                 "source_sha256": source_sha256,
+                "course_fingerprint": course_fingerprint,
                 "total_weeks": total_weeks,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -950,6 +1017,143 @@ def prepare_generation_manifest(
         + "\n",
     )
     return matching or legacy
+
+
+# Files that make up one reusable week. audio/ is deliberately excluded: it is
+# many megabytes per week, it is regenerable from script.json in minutes, and
+# the resumable pipeline already knows how to record a missing track.
+REUSABLE_WEEK_FILES = ("script.json", "slides.md", "quiz.json", "lecture.json")
+
+
+def find_reusable_course(
+    sid: str, source_sha256: str, course_fingerprint: str
+) -> tuple[str, int] | None:
+    """Another learner's finished course for these exact bytes and generator.
+
+    Returns ``(donor_sid, total_weeks)``, or None when nothing is adoptable.
+    Both halves of the key must match: the bytes, so it is the same book, and
+    the fingerprint, so it was built by the generator running now.
+    """
+    if fetch_all is None:
+        return None
+    owners = fetch_all(
+        """SELECT DISTINCT student_id FROM books
+            WHERE source_sha256 = %s AND student_id <> %s
+              AND status IN ('ready', 'partial')""",
+        (source_sha256, sid),
+    )
+    for owner in owners:
+        donor = owner.get("student_id")
+        if not donor:
+            continue
+        manifest = _read_json(LECTURES_DIR / donor / GENERATION_MANIFEST)
+        if not manifest:
+            continue
+        if manifest.get("source_sha256") != source_sha256:
+            continue
+        if manifest.get("course_fingerprint") != course_fingerprint:
+            continue
+        total = int(manifest.get("total_weeks") or 0)
+        if total < 1:
+            continue
+        # Only adopt a course whose weeks are all actually on disk. A donor
+        # halfway through its own build would hand over gaps.
+        if all(valid_lecture_checkpoint(donor, week) for week in range(1, total + 1)):
+            return donor, total
+    return None
+
+
+def adopt_course(donor: str, sid: str, total_weeks: int) -> None:
+    """Copy a donor's generated weeks into this learner's namespace.
+
+    Every learner keeps their OWN copy rather than sharing a directory: the
+    live lecture, the slide build and the exam sync all read
+    ``lectures/<sid>/``, and a shared path would make one learner's regenerate
+    silently rewrite another's course.
+    """
+    source_root = (LECTURES_DIR / donor).resolve()
+    target_root = (LECTURES_DIR / sid).resolve()
+    if not source_root.is_dir():
+        raise RuntimeError(f"donor course {donor} is not on disk")
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    plan = source_root / "semester-plan.json"
+    if not plan.is_file():
+        raise RuntimeError(f"donor course {donor} has no semester plan")
+    shutil.copy2(plan, target_root / "semester-plan.json")
+
+    for week in range(1, total_weeks + 1):
+        source_week = source_root / f"week-{week}"
+        target_week = target_root / f"week-{week}"
+        target_week.mkdir(parents=True, exist_ok=True)
+        for name in REUSABLE_WEEK_FILES:
+            candidate = source_week / name
+            if candidate.is_file():
+                shutil.copy2(candidate, target_week / name)
+
+
+def finish_adopted_course(sid: str, book_id: int, total_weeks: int) -> None:
+    """Publish an adopted course: decks, artifacts, milestones, final state.
+
+    Everything the model would have produced is already on disk, so only the
+    per-learner work is left. Slides are rebuilt rather than copied because a
+    built deck hard-codes its own ``/slides/<sid>/`` base path, and audio is
+    left for the normal deferred pass — it is regenerable from script.json and
+    a learner is not blocked from attending without it.
+    """
+    for week in range(1, total_weeks + 1):
+        script = _read_json(LECTURES_DIR / sid / f"week-{week}" / "script.json") or {}
+        for stage, note in (("lecture", "Reused lecture"), ("quiz", "Reused quiz")):
+            mark_milestone(
+                book_id,
+                sid,
+                week,
+                stage,
+                "ready",
+                message=f"{note} from an identical book",
+                artifact_ref=(
+                    f"lectures/{sid}/week-{week}/"
+                    f"{'script.json' if stage == 'lecture' else 'quiz.json'}"
+                ),
+            )
+        message = f"Publishing lecture {week} of {total_weeks}…"
+        progress(book_id, message)
+        mark_milestone(book_id, sid, week, "slides", "running", message=message)
+        build_slides(sid, week)
+        mark_milestone(
+            book_id,
+            sid,
+            week,
+            "slides",
+            "ready",
+            message="Slide deck published",
+            artifact_ref=f"UnivAI-app/public/slides/{sid}/week-{week}/index.html",
+        )
+        mark_milestone(
+            book_id,
+            sid,
+            week,
+            "audio",
+            "deferred",
+            message="Queued for a later generation step",
+        )
+        register_week_artifacts(sid, week)
+        title = str(script.get("title") or "").strip()
+        if title:
+            execute(
+                "UPDATE lectures SET title = %s WHERE week = %s AND student_id = %s",
+                (title, week, sid),
+            )
+        refresh_book_counts(book_id)
+
+    core_ready, audio_ready = refresh_book_counts(book_id)
+    update_book_state(
+        book_id,
+        "partial",
+        "paused",
+        f"Course ready from an identical book — {core_ready}/{total_weeks} lectures; "
+        f"{audio_ready}/{total_weeks} audio tracks. Continue when convenient.",
+    )
 
 
 def initialize_milestones(book_id: int, sid: str, total_weeks: int) -> None:
@@ -1047,11 +1251,21 @@ def main() -> int:
 
     load_integrated_dependencies()
     if len(sys.argv) < 3:
-        print(json.dumps({"ok": False, "error": "usage: lecture_gen.py <pdf_path> <book_id> [--quizzes-only]"}))
+        print(json.dumps({
+            "ok": False,
+            "error": "usage: lecture_gen.py <pdf_path> <book_id> [--quizzes-only|--plan-only]",
+        }))
         return 2
     pdf_path = Path(sys.argv[1]).resolve()
     book_id = int(sys.argv[2])
     quizzes_only = "--quizzes-only" in sys.argv[3:]
+    # Discover the chapters and stop. The curriculum a learner approves is built
+    # from semester-plan.json, so the plan has to exist before they can approve
+    # anything — but writing lectures, quizzes, slides and voice for a course
+    # they have not agreed to is hours of work thrown away the moment they
+    # reshape it. Planning is pure Python (no model calls), so this pass is
+    # cheap; the expensive stages wait for approval to spawn the full run.
+    plan_only = "--plan-only" in sys.argv[3:]
 
     book = fetch_one(
         """SELECT id, student_id, title, filename, status, pages, source_sha256,
@@ -1082,6 +1296,7 @@ def main() -> int:
     total_weeks = 0
     try:
         source_sha256 = file_sha256(pdf_path)
+        fingerprint = course_components().fingerprint()
         saved_manifest = _read_json(LECTURES_DIR / sid / GENERATION_MANIFEST)
         saved_total = int(book.get("generation_total_weeks") or 0)
         fast_audio_resume = bool(
@@ -1093,6 +1308,39 @@ def main() -> int:
             and saved_manifest.get("source_sha256") == source_sha256
             and (LECTURES_DIR / sid / "semester-plan.json").is_file()
         )
+
+        # Someone has already paid for this exact book to be turned into this
+        # exact course. Adopt it instead of spending the model again — the
+        # learner gets their course in seconds rather than half an hour.
+        # Skipped for a resume (this learner already has work in progress) and
+        # for the cheap plan-only pass, which is pure Python anyway.
+        adopted = None
+        if not quizzes_only and not plan_only and not fast_audio_resume:
+            adopted = find_reusable_course(sid, source_sha256, fingerprint)
+
+        if adopted:
+            donor, total_weeks = adopted
+            message = f"Reusing a course already built from this book — {total_weeks} weeks."
+            update_book_state(book_id, "generating", "reusing", message)
+            progress(book_id, message)
+            adopt_course(donor, sid, total_weeks)
+            execute(
+                """UPDATE books SET pages = %s, source_sha256 = %s,
+                       generation_total_weeks = %s, generation_stage = 'content',
+                       error = NULL WHERE id = %s""",
+                (int(book.get("pages") or 0), source_sha256, total_weeks, book_id),
+            )
+            prepare_generation_manifest(
+                sid, book_id, source_sha256, total_weeks, fingerprint
+            )
+            initialize_milestones(book_id, sid, total_weeks)
+            finish_adopted_course(sid, book_id, total_weeks)
+            print(
+                json.dumps(
+                    {"ok": True, "weeks": total_weeks, "reused_from": donor}
+                )
+            )
+            return 0
 
         if fast_audio_resume:
             total_weeks = saved_total
@@ -1125,7 +1373,7 @@ def main() -> int:
             write_semester_plan(sid, plan)
             remove_obsolete_weeks(sid, total_weeks)
             resume_files = prepare_generation_manifest(
-                sid, book_id, source_sha256, total_weeks
+                sid, book_id, source_sha256, total_weeks, fingerprint
             )
             execute(
                 """UPDATE books SET generation_total_weeks = %s,
@@ -1133,6 +1381,22 @@ def main() -> int:
                 (total_weeks, book_id),
             )
             initialize_milestones(book_id, sid, total_weeks)
+
+        if plan_only:
+            update_book_state(
+                book_id,
+                "awaiting_approval",
+                "plan",
+                f"Course plan ready — {total_weeks} weeks. "
+                "Approve your curriculum to start building the lectures.",
+            )
+            print(
+                f"[lecture-gen] plan only: {total_weeks} weeks discovered, "
+                "waiting for curriculum approval",
+                flush=True,
+            )
+            print(json.dumps({"ok": True, "weeks": total_weeks, "plan_only": True}))
+            return 0
 
         if quizzes_only:
             regenerate_quizzes(sid, book_id, weeks)
