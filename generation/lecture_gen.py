@@ -1144,6 +1144,315 @@ def prepare_generation_manifest(
     return matching
 
 
+# ── Course adoption ───────────────────────────────────────────────────
+#
+# The same textbook uploaded by a second learner must not be written twice. A
+# course is a pure function of the bytes it was built from and the pipeline
+# that built it, so when both match a finished course the content is already
+# correct for the new learner and is copied instead of regenerated.
+#
+# Copied: lectures, narration, slides, quizzes, section packs — the teaching.
+# Never copied: attendance, exam attempts, scores. Those are keyed by student
+# and stay the learner's own, which is the whole point of separating them.
+
+
+def find_reusable_course(
+    sid: str,
+    book_id: int,
+    source_sha256: str,
+    course_fingerprint: str,
+    semester_plan: dict | None,
+) -> dict | None:
+    """Find a finished course built from these exact bytes by this pipeline.
+
+    Every condition here is a reason the copy would otherwise be wrong:
+    different bytes mean a different book, a different fingerprint means the
+    prompts or lecture shape moved on, and a different semester plan means the
+    weeks would not line up with the curriculum this learner approved.
+    """
+    if not semester_plan:
+        return None
+    # 'partial' is a statement about narration bookkeeping, not about teaching:
+    # a course whose weeks are all written sits at 'partial' until its audio
+    # counters agree. Completeness is therefore decided below, per week, from
+    # the artifacts themselves — the only evidence that cannot be stale.
+    donors = fetch_all(
+        """SELECT b.id, b.student_id, b.generation_total_weeks AS total_weeks,
+                  b.generation_manifest, b.semester_plan
+             FROM books b
+            WHERE b.source_sha256 = %s
+              AND b.id <> %s
+              AND b.status IN ('ready', 'partial')
+              AND b.generation_total_weeks > 0
+              AND b.semester_plan IS NOT NULL
+            ORDER BY b.id""",
+        (source_sha256, book_id),
+    )
+    for donor in donors or []:
+        manifest = donor.get("generation_manifest") or {}
+        if manifest.get("course_fingerprint") != course_fingerprint:
+            continue
+        if donor.get("semester_plan") != semester_plan:
+            continue
+        total_weeks = int(donor.get("total_weeks") or 0)
+        complete_weeks = fetch_one(
+            """SELECT count(*) AS ready FROM lecture_artifacts
+                WHERE book_id = %s
+                  AND jsonb_array_length(COALESCE(lecture_payload->'slides','[]'::jsonb)) > 0
+                  AND jsonb_array_length(COALESCE(script_payload->'segments','[]'::jsonb)) > 0
+                  AND jsonb_array_length(COALESCE(quiz_payload->'questions','[]'::jsonb)) > 0""",
+            (donor["id"],),
+        )
+        if int((complete_weeks or {}).get("ready") or 0) < total_weeks:
+            continue
+        return donor
+    return None
+
+
+def learner_has_edited_curriculum(sid: str) -> bool:
+    """A reshaped curriculum earns a real build, not somebody else's course."""
+    programme = fetch_one(
+        """SELECT plan_version FROM programmes
+            WHERE student_id = %s AND status = 'approved'
+            ORDER BY id DESC LIMIT 1""",
+        (sid,),
+    )
+    return bool(programme and int(programme.get("plan_version") or 1) > 1)
+
+
+def _reuse_slidev_cache(donor_artifact_id: str, artifact_id: str) -> bool:
+    """Hardlink a built deck to the adopting learner's artifact id.
+
+    Slidev output is immutable and rebuilt by replacement, so links are safe;
+    a filesystem that refuses them falls back to a copy. Returns False when the
+    donor has no build, leaving the deck to be compiled normally.
+    """
+    donor_dir = _slidev_cache_dir(donor_artifact_id)
+    if not (donor_dir / "index.html").is_file():
+        return False
+    target = _slidev_cache_dir(artifact_id)
+    if target.exists():
+        shutil.rmtree(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copytree(donor_dir, target, copy_function=os.link)
+    except OSError:
+        shutil.rmtree(target, ignore_errors=True)
+        try:
+            shutil.copytree(donor_dir, target)
+        except OSError:
+            shutil.rmtree(target, ignore_errors=True)
+            return False
+    return (target / "index.html").is_file()
+
+
+def adopt_course(sid: str, book_id: int, donor: dict) -> int:
+    """Copy a finished course onto this learner and return the weeks adopted."""
+    donor_id = int(donor["id"])
+    weeks = fetch_all(
+        """SELECT artifact_id::text AS artifact_id, week, title, lecture_payload,
+                  script_payload, slides_payload, quiz_payload
+             FROM lecture_artifacts WHERE book_id = %s ORDER BY week""",
+        (donor_id,),
+    )
+    adopted = 0
+    for row in weeks or []:
+        week = int(row["week"])
+        # A fresh artifact id per learner: the row is theirs, and script
+        # payloads carry their own lectureId so nothing points back at the
+        # donor. Everything else about the teaching is byte-identical.
+        execute(
+            """
+            INSERT INTO lecture_artifacts
+              (artifact_id, book_id, student_id, week, title, lecture_payload,
+               script_payload, slides_payload, quiz_payload, created_at, updated_at)
+            SELECT generated_id, %s, %s, %s, %s, %s::jsonb,
+                   (%s::jsonb - 'lectureId')
+                     || jsonb_build_object('lectureId', generated_id::text),
+                   %s::jsonb, %s::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+              FROM (SELECT gen_random_uuid() AS generated_id) generated
+            ON CONFLICT (book_id, week) DO UPDATE SET
+              student_id = EXCLUDED.student_id,
+              title = EXCLUDED.title,
+              lecture_payload = EXCLUDED.lecture_payload,
+              script_payload = (EXCLUDED.script_payload - 'lectureId')
+                || jsonb_build_object('lectureId', lecture_artifacts.artifact_id::text),
+              slides_payload = EXCLUDED.slides_payload,
+              quiz_payload = EXCLUDED.quiz_payload,
+              updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                book_id,
+                sid,
+                week,
+                row["title"],
+                json.dumps(row["lecture_payload"], ensure_ascii=False),
+                json.dumps(row["script_payload"], ensure_ascii=False),
+                json.dumps(row["slides_payload"], ensure_ascii=False),
+                json.dumps(row["quiz_payload"], ensure_ascii=False)
+                if row.get("quiz_payload")
+                else None,
+            ),
+        )
+        register_week_artifacts(sid, week, book_id)
+        for stage in ("lecture", "quiz"):
+            mark_milestone(
+                book_id,
+                sid,
+                week,
+                stage,
+                "ready",
+                message="Adopted from an identical book",
+                artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}",
+            )
+        saved = lecture_artifact(sid, week, book_id)
+        if saved and _reuse_slidev_cache(row["artifact_id"], str(saved["artifact_id"])):
+            mark_milestone(
+                book_id,
+                sid,
+                week,
+                "slides",
+                "ready",
+                message="Adopted a built deck",
+                artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}:slides",
+            )
+        else:
+            # The deck is derived from slides_payload, so a missing donor build
+            # costs a local Slidev run, never a regenerated lecture.
+            try:
+                build_slides(sid, week, book_id)
+                mark_milestone(
+                    book_id,
+                    sid,
+                    week,
+                    "slides",
+                    "ready",
+                    message="Slide deck built",
+                    artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}:slides",
+                )
+            except Exception as error:  # noqa: BLE001 - a deck must not sink the course
+                mark_milestone(
+                    book_id, sid, week, "slides", "failed", message=str(error)[:400]
+                )
+        mark_milestone(
+            book_id,
+            sid,
+            week,
+            "audio",
+            "ready",
+            message="On-demand lecture voice ready",
+            artifact_ref="runtime:live-tts",
+        )
+        adopted += 1
+    adopt_section_packs(sid, book_id, donor_id)
+    return adopted
+
+
+def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
+    """Re-key the donor's grounded sections onto this learner's approved plan.
+
+    Section packs are addressed by tenant and approved plan version, not by
+    book, so a copy has to be rewritten into the adopting learner's programme
+    or the app would never find it.
+    """
+    programme = fetch_one(
+        """SELECT id, plan_version FROM programmes
+            WHERE student_id = %s AND status = 'approved'
+            ORDER BY id DESC LIMIT 1""",
+        (sid,),
+    )
+    if not programme:
+        return
+    programme_id = str(programme["id"])
+    plan_version = int(programme["plan_version"])
+    packs = fetch_all(
+        """SELECT week, prompt_id, prompt_version, payload_hash, pack_payload
+             FROM section_packs WHERE course_id = %s ORDER BY week""",
+        (f"book-{donor_id}",),
+    )
+    for pack in packs or []:
+        week = int(pack["week"])
+        artifact = lecture_artifact(sid, week, book_id)
+        if not artifact:
+            continue
+        execute(
+            """
+            INSERT INTO section_packs
+              (schema_version, tenant_id, programme_id, course_id, week, lecture_id,
+               approved_plan_id, approved_plan_version, prompt_id, prompt_version,
+               payload_hash, pack_payload, created_at)
+            VALUES
+              ('section-pack-v1', %s, %s, %s, %s, %s, %s, %s, %s, %s,
+               %s, %s::jsonb, CURRENT_TIMESTAMP)
+            ON CONFLICT (tenant_id, approved_plan_id, approved_plan_version, week)
+            DO UPDATE SET
+              programme_id = EXCLUDED.programme_id,
+              course_id = EXCLUDED.course_id,
+              lecture_id = EXCLUDED.lecture_id,
+              prompt_id = EXCLUDED.prompt_id,
+              prompt_version = EXCLUDED.prompt_version,
+              payload_hash = EXCLUDED.payload_hash,
+              pack_payload = EXCLUDED.pack_payload,
+              created_at = CURRENT_TIMESTAMP
+            """,
+            (
+                sid,
+                programme_id,
+                f"book-{book_id}",
+                week,
+                str(artifact["artifact_id"]),
+                programme_id,
+                plan_version,
+                pack["prompt_id"],
+                pack["prompt_version"],
+                pack["payload_hash"],
+                json.dumps(pack["pack_payload"], ensure_ascii=False),
+            ),
+        )
+        mark_milestone(
+            book_id,
+            sid,
+            week,
+            "section",
+            "ready",
+            message="Adopted a grounded section",
+            artifact_ref=f"db:section_packs:{book_id}:week:{week}",
+        )
+
+
+def warm_narration_cache(book_id: int) -> bool:
+    """Render this course's narration into the shared cache, in the background.
+
+    Live synthesizes on demand, so a cold cache costs the first lecture its
+    opening sentences rather than its voice. Warming it here moves that cost
+    off the learner. Detached and best-effort by design: the course is already
+    finished and usable, and a missing voice model must not fail it.
+    """
+    script = ROOT / "UnivAI-live" / "prerender_audio.py"
+    python = ROOT / ".venv" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    if not script.is_file() or not python.is_file():
+        return False
+    logs = ROOT / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(logs / "prerender-audio.log", "a", encoding="utf-8") as log:
+            subprocess.Popen(
+                [str(python), str(script), "--book", str(book_id)],
+                cwd=str(ROOT),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                start_new_session=os.name != "nt",
+            )
+    except OSError as error:
+        print(f"[lecture-gen] narration warm-up did not start: {error}", flush=True)
+        return False
+    print(f"[lecture-gen] warming narration cache for book {book_id}", flush=True)
+    return True
+
+
 def initialize_milestones(book_id: int, sid: str, total_weeks: int) -> None:
     mark_milestone(book_id, sid, 0, "plan", "ready", message="Course plan saved")
     execute(
@@ -1346,6 +1655,51 @@ def main() -> int:
             )
             print(json.dumps({"ok": True, "weeks": total_weeks, "plan_only": True}))
             return 0
+
+        # The learner has approved a curriculum built from this plan. If another
+        # learner already has a finished course from the same bytes and the same
+        # pipeline, that course IS this course — writing it again would cost a
+        # full run of model calls to arrive somewhere no better.
+        if not quizzes_only and not learner_has_edited_curriculum(sid):
+            plan_row = fetch_one("SELECT semester_plan FROM books WHERE id = %s", (book_id,))
+            donor = find_reusable_course(
+                sid,
+                book_id,
+                source_sha256,
+                fingerprint,
+                (plan_row or {}).get("semester_plan"),
+            )
+            if donor:
+                message = f"Found this book already taught — reusing {donor['total_weeks']} weeks…"
+                update_book_state(book_id, "generating", "adopting", message)
+                progress(book_id, message)
+                adopted = adopt_course(sid, book_id, donor)
+                if adopted:
+                    total_weeks = adopted
+                    execute(
+                        """UPDATE books SET generation_total_weeks = %s,
+                               generation_stage = 'content', error = NULL WHERE id = %s""",
+                        (total_weeks, book_id),
+                    )
+                    core_ready, audio_ready = refresh_book_counts(book_id)
+                    update_book_state(
+                        book_id,
+                        "ready",
+                        "complete",
+                        f"Course ready — {core_ready}/{total_weeks} lectures reused "
+                        "from an identical book.",
+                    )
+                    warm_narration_cache(book_id)
+                    print(
+                        f"[lecture-gen] adopted {adopted} weeks from book {donor['id']}",
+                        flush=True,
+                    )
+                    print(json.dumps({
+                        "ok": True,
+                        "weeks": total_weeks,
+                        "adopted_from": donor["id"],
+                    }))
+                    return 0
 
         if quizzes_only:
             regenerate_quizzes(sid, book_id, weeks)
@@ -1552,6 +1906,8 @@ def main() -> int:
                 f"{audio_ready}/{total_weeks} narration runtimes ready. Continue when convenient."
             )
         update_book_state(book_id, final_status, final_stage, final_message)
+        if core_ready:
+            warm_narration_cache(book_id)
         print(
             json.dumps(
                 {
