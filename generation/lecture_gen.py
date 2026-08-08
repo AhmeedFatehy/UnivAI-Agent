@@ -1357,6 +1357,32 @@ def adopt_course(sid: str, book_id: int, donor: dict) -> int:
     return adopted
 
 
+def rekey_section_payload(
+    payload: dict,
+    *,
+    sid: str,
+    book_id: int,
+    topic_id: str,
+    programme_title: str,
+    plan_version: int,
+) -> dict:
+    """Make a copied pack describe the learner who is about to be taught it.
+
+    Live re-reads the pack's own identity and refuses when it disagrees with
+    the row it arrived in (protocols/section_session.py). Copying the payload
+    unchanged therefore produced a section that failed its own contract at join
+    time with ``section_artifact_unavailable`` — the columns said one learner
+    and the payload still said another.
+    """
+    rekeyed = dict(payload)
+    rekeyed["user_id"] = sid
+    rekeyed["course_id"] = f"book-{book_id}"
+    rekeyed["topic_id"] = topic_id
+    rekeyed["programme_title"] = programme_title
+    rekeyed["plan_version"] = str(plan_version)
+    return rekeyed
+
+
 def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
     """Re-key the donor's grounded sections onto this learner's approved plan.
 
@@ -1365,7 +1391,7 @@ def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
     or the app would never find it.
     """
     programme = fetch_one(
-        """SELECT id, plan_version FROM programmes
+        """SELECT id, name, plan_version FROM programmes
             WHERE student_id = %s AND status = 'approved'
             ORDER BY id DESC LIMIT 1""",
         (sid,),
@@ -1373,6 +1399,7 @@ def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
     if not programme:
         return
     programme_id = str(programme["id"])
+    programme_title = str(programme["name"])
     plan_version = int(programme["plan_version"])
     packs = fetch_all(
         """SELECT week, prompt_id, prompt_version, payload_hash, pack_payload
@@ -1384,6 +1411,17 @@ def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
         artifact = lecture_artifact(sid, week, book_id)
         if not artifact:
             continue
+        payload = rekey_section_payload(
+            pack["pack_payload"],
+            sid=sid,
+            book_id=book_id,
+            topic_id=str(artifact["artifact_id"]),
+            programme_title=programme_title,
+            plan_version=plan_version,
+        )
+        serialized = json.dumps(payload, ensure_ascii=False)
+        # The hash covers the payload as stored, so it has to follow the re-key.
+        payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         execute(
             """
             INSERT INTO section_packs
@@ -1414,8 +1452,8 @@ def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
                 plan_version,
                 pack["prompt_id"],
                 pack["prompt_version"],
-                pack["payload_hash"],
-                json.dumps(pack["pack_payload"], ensure_ascii=False),
+                payload_hash,
+                serialized,
             ),
         )
         mark_milestone(

@@ -9,6 +9,7 @@ real build.
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -231,7 +232,7 @@ def test_sections_are_rekeyed_onto_the_adopting_learners_approved_plan(monkeypat
 
     def fetch_one(sql, params=None):
         if "FROM programmes" in sql:
-            return {"id": 9, "plan_version": 1}
+            return {"id": 9, "name": "My Library Curriculum", "plan_version": 1}
         return {"artifact_id": "22222222-2222-4222-8222-222222222222"}
 
     monkeypatch.setattr(lecture_gen, "fetch_one", fetch_one)
@@ -252,7 +253,88 @@ def test_sections_are_rekeyed_onto_the_adopting_learners_approved_plan(monkeypat
     assert params[1] == "9"
     assert params[2] == "book-8"
     assert params[5] == "9"
-    assert json.loads(params[10]) == pack["pack_payload"]
+    # The teaching survives the copy, and the payload's own identity is rewritten
+    # to match the row — Live refuses a pack that disagrees with its session.
+    stored = json.loads(params[10])
+    assert stored["title"] == "Practical: Transactions"
+    assert stored["user_id"] == "S-2026-000005"
+    assert stored["course_id"] == "book-8"
+    assert stored["topic_id"] == "22222222-2222-4222-8222-222222222222"
+    assert stored["programme_title"] == "My Library Curriculum"
+
+
+def test_an_adopted_pack_describes_the_learner_it_was_copied_to(monkeypatch):
+    """Live re-reads the pack's own identity and refuses when it disagrees.
+
+    Copying pack_payload verbatim re-keyed the row but left the payload naming
+    the donor, so joining the section failed with section_artifact_unavailable
+    — the columns said one learner and the JSON still said another.
+    """
+    donor_payload = {
+        "schema_name": "univai.section.pack",
+        "user_id": "S-2026-000004",
+        "course_id": "book-7",
+        "topic_id": "11111111-1111-4111-8111-111111111111",
+        "week_number": 1,
+        "programme_title": "Donor Curriculum",
+        "plan_version": "1",
+        "title": "Practical: Transactions",
+    }
+
+    rekeyed = lecture_gen.rekey_section_payload(
+        donor_payload,
+        sid="S-2026-000005",
+        book_id=8,
+        topic_id="22222222-2222-4222-8222-222222222222",
+        programme_title="My Library Curriculum",
+        plan_version=3,
+    )
+
+    assert rekeyed["user_id"] == "S-2026-000005"
+    assert rekeyed["course_id"] == "book-8"
+    assert rekeyed["topic_id"] == "22222222-2222-4222-8222-222222222222"
+    assert rekeyed["programme_title"] == "My Library Curriculum"
+    assert rekeyed["plan_version"] == "3"
+    # The teaching itself is untouched, and the donor's copy is not mutated.
+    assert rekeyed["title"] == "Practical: Transactions"
+    assert rekeyed["week_number"] == 1
+    assert donor_payload["user_id"] == "S-2026-000004"
+
+
+def test_the_stored_hash_follows_the_rekeyed_payload(monkeypatch):
+    written: list[tuple[str, tuple]] = []
+
+    def fetch_one(sql, params=None):
+        if "FROM programmes" in sql:
+            return {"id": 9, "name": "My Library Curriculum", "plan_version": 1}
+        return {"artifact_id": "22222222-2222-4222-8222-222222222222"}
+
+    monkeypatch.setattr(lecture_gen, "fetch_one", fetch_one)
+    monkeypatch.setattr(
+        lecture_gen,
+        "fetch_all",
+        lambda sql, params=None: [
+            {
+                "week": 1,
+                "prompt_id": "teaching/section_generation",
+                "prompt_version": "1.0.0",
+                "payload_hash": "0" * 64,
+                "pack_payload": {"user_id": "donor", "course_id": "book-7", "title": "P"},
+            }
+        ],
+    )
+    monkeypatch.setattr(lecture_gen, "execute", lambda sql, params: written.append((sql, params)))
+    monkeypatch.setattr(lecture_gen, "mark_milestone", lambda *a, **k: None)
+
+    lecture_gen.adopt_section_packs("S-2026-000005", 8, 7)
+
+    params = next(params for sql, params in written if "INSERT INTO section_packs" in sql)
+    stored_hash, stored_payload = params[9], params[10]
+    assert stored_hash != "0" * 64, "the donor's hash cannot describe a re-keyed payload"
+    assert (
+        hashlib.sha256(stored_payload.encode("utf-8")).hexdigest() == stored_hash
+    )
+    assert json.loads(stored_payload)["user_id"] == "S-2026-000005"
 
 
 def test_a_section_without_its_lecture_is_skipped(monkeypatch):
@@ -260,7 +342,7 @@ def test_a_section_without_its_lecture_is_skipped(monkeypatch):
     monkeypatch.setattr(
         lecture_gen,
         "fetch_one",
-        lambda sql, params=None: {"id": 9, "plan_version": 1}
+        lambda sql, params=None: {"id": 9, "name": "My Library Curriculum", "plan_version": 1}
         if "FROM programmes" in sql
         else None,
     )
