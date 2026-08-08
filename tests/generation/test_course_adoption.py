@@ -61,6 +61,27 @@ def test_an_identical_book_is_adopted_from_the_learner_who_already_has_it(monkey
     assert found["id"] == 7
 
 
+def test_the_earliest_course_wins_when_a_book_has_been_taught_twice(monkeypatch):
+    """A regenerated copy must not become the course new learners inherit.
+
+    Once an admin regenerates one learner's course, two identical-by-fingerprint
+    courses exist for the same book. The earliest is the one the most learners
+    already hold, so a class converges on a single shared course instead of
+    splintering with every regeneration.
+    """
+    original = donor_row(id=1, student_id="S-2026-000005")
+    regenerated = donor_row(id=2, student_id="S-2026-000001")
+    # Returned in the query's own order: ORDER BY b.id ASC.
+    install_db(monkeypatch, donors=[original, regenerated])
+
+    found = lecture_gen.find_reusable_course(
+        "S-2026-000003", 99, "sha-abc", FINGERPRINT, PLAN
+    )
+
+    assert found is not None
+    assert found["id"] == 1, "a third learner must inherit the original course"
+
+
 def test_a_finished_course_still_counted_partial_is_adopted(monkeypatch):
     """'partial' tracks narration bookkeeping, not whether the weeks were written.
 

@@ -1185,6 +1185,13 @@ def find_reusable_course(
     # a course whose weeks are all written sits at 'partial' until its audio
     # counters agree. Completeness is therefore decided below, per week, from
     # the artifacts themselves — the only evidence that cannot be stale.
+    #
+    # ORDER BY b.id ascending is the tie-break, and it is deliberate: when the
+    # same book has been taught more than once, the earliest course wins. That
+    # is the one the most learners already hold, so a class converges on a
+    # single shared course instead of splintering every time an admin
+    # regenerates one learner's copy. Ordering by recency would hand each new
+    # learner whichever version happened to be rebuilt last.
     donors = fetch_all(
         """SELECT b.id, b.student_id, b.generation_total_weeks AS total_weeks,
                   b.generation_manifest, b.semester_plan
@@ -1194,7 +1201,7 @@ def find_reusable_course(
               AND b.status IN ('ready', 'partial')
               AND b.generation_total_weeks > 0
               AND b.semester_plan IS NOT NULL
-            ORDER BY b.id""",
+            ORDER BY b.id ASC""",
         (source_sha256, book_id),
     )
     for donor in donors or []:
