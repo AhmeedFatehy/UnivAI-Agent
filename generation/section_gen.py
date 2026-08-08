@@ -45,6 +45,10 @@ from tools.registry import (
 
 DEFAULT_EVIDENCE_LIMIT = 8
 DEFAULT_FOCUS = "the material covered in the lecture"
+# One retrieval per slide would mean ~50 round trips for a single section, most
+# of them returning the same passages. A sample spread across the deck covers
+# the lecture's span at a fraction of the cost.
+MAX_SECTION_SEEDS = 10
 
 
 class SectionGenerationError(RuntimeError):
@@ -73,27 +77,101 @@ class SectionRun(BaseModel):
         return self.outcome.refusal
 
 
+def section_seed_queries(identity: SectionIdentity, topics: list[str] | None) -> list[str]:
+    """The subjects to retrieve on: the lecture's own slide headings.
+
+    Retrieval is scored by ``term_coverage`` — the share of the QUERY's terms
+    found in one passage. A single query of ``"<title>. the material covered in
+    the lecture"`` therefore demanded that a textbook passage contain the words
+    "material", "covered" and "lecture", which no passage does. For a one-word
+    title such as "Triggers" the best attainable coverage was 1/4 = 0.25 against
+    a 0.34 threshold, so those sections could never ground no matter how good
+    the book was.
+
+    Slide headings are what the lecture actually taught, and each is short and
+    purely topical, so coverage measures topic overlap and nothing else.
+    """
+    headings: list[str] = []
+    seen: set[str] = set()
+    for candidate in topics or []:
+        text = " ".join(str(candidate or "").split())
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            headings.append(text)
+
+    # Sample evenly rather than taking the first N: a lecture's opening slides
+    # are introductions, and the practical material sits later in the deck.
+    if len(headings) > MAX_SECTION_SEEDS:
+        stride = len(headings) / MAX_SECTION_SEEDS
+        headings = [headings[int(index * stride)] for index in range(MAX_SECTION_SEEDS)]
+
+    title = " ".join(str(identity.lecture_title or "").split())
+    if title and title.casefold() not in {heading.casefold() for heading in headings}:
+        headings.append(title)
+    return headings
+
+
 def retrieve_section_evidence(
     tool_context: ToolContext,
     identity: SectionIdentity,
     *,
     focus: str = DEFAULT_FOCUS,
     limit: int = DEFAULT_EVIDENCE_LIMIT,
+    topics: list[str] | None = None,
 ) -> GroundedContext:
-    """Pull passages on which to ground the section, honouring tenant isolation."""
-    query = f"{identity.lecture_title}. {focus}"
-    context = call_tool(
-        "retrieve_context",
-        RetrieveContextInput(
+    """Pull passages on which to ground the section, honouring tenant isolation.
+
+    Each slide heading is retrieved separately and the results are merged, so
+    one weak heading cannot starve the whole section. Passage ids are renumbered
+    across the merged set so the model sees one continuous evidence block.
+    """
+    seeds = section_seed_queries(identity, topics)
+    merged: list = []
+    seen: set[tuple[str, int | None]] = set()
+    last_refusal: Refusal | None = None
+
+    for seed in seeds:
+        context = call_tool(
+            "retrieve_context",
+            RetrieveContextInput(
+                query=seed,
+                user_id=identity.user_id,
+                collection_id=identity.collection_id,
+                limit=limit,
+            ),
+            tool_context,
+        )
+        assert isinstance(context, GroundedContext)
+        if not context.grounded:
+            last_refusal = context.refusal
+            continue
+        for passage in context.passages:
+            key = (passage.citation.document_id, passage.citation.chunk_index)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(passage)
+
+    query = "; ".join(seeds)
+    if not merged:
+        return GroundedContext(
             query=query,
-            user_id=identity.user_id,
-            collection_id=identity.collection_id,
-            limit=limit,
-        ),
-        tool_context,
-    )
-    assert isinstance(context, GroundedContext)
-    return context
+            grounded=False,
+            refusal=last_refusal
+            or Refusal(
+                reason="No indexed material matched this lecture's slides.",
+                query=query,
+                scope={"collection_id": identity.collection_id},
+            ),
+        )
+
+    merged.sort(key=lambda passage: -passage.score)
+    renumbered = [
+        passage.model_copy(update={"passage_id": f"S{index}", "rank": index})
+        for index, passage in enumerate(merged[: limit * 2], start=1)
+    ]
+    return GroundedContext(query=query, grounded=True, passages=renumbered)
 
 
 def _generate_section_draft(
@@ -144,14 +222,19 @@ def generate_section_pack(
     evidence_limit: int = DEFAULT_EVIDENCE_LIMIT,
     repair_attempts: int = 1,
     on_call: Callable[[], None] | None = None,
+    topics: list[str] | None = None,
 ) -> SectionRun:
-    """Generate a validated section pack, or a grounded refusal."""
+    """Generate a validated section pack, or a grounded refusal.
+
+    ``topics`` are the lecture's slide headings; they decide what the section
+    is grounded on, so a section teaches practice for what the lecture taught.
+    """
     template = load_prompt_for(PromptOperation.CONTENT_GENERATE_SECTION)
     repair_template = load_prompt_for(PromptOperation.CONTENT_REPAIR_SECTION)
     prompts: list[str] = []
 
     context = retrieve_section_evidence(
-        tool_context, identity, focus=focus, limit=evidence_limit
+        tool_context, identity, focus=focus, limit=evidence_limit, topics=topics
     )
     if not context.grounded:
         return SectionRun(

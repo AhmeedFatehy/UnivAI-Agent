@@ -910,6 +910,14 @@ def generate_and_store_section(
         lecture_title=lecture_title,
         created_at=datetime.now(timezone.utc).isoformat(),
     )
+    # The section practises what the lecture taught, so it is grounded on that
+    # lecture's own slide headings rather than on the week's title alone.
+    slides = artifact.get("slides_payload") or {}
+    topics = [
+        str(slide.get("heading") or "").strip()
+        for slide in (slides.get("slides") or [])
+        if isinstance(slide, dict) and str(slide.get("heading") or "").strip()
+    ]
     run = generate_section_pack(
         llm=lambda prompt: complete(
             prompt, system=_SECTION_PROMPT.system, max_tokens=4000
@@ -917,6 +925,7 @@ def generate_and_store_section(
         identity=identity,
         tool_context=ToolContext(),
         focus=focus,
+        topics=topics,
         on_call=lambda: progress(book_id, f"Writing grounded section {week}…"),
     )
     if run.section is None:
@@ -1176,6 +1185,13 @@ def find_reusable_course(
     # a course whose weeks are all written sits at 'partial' until its audio
     # counters agree. Completeness is therefore decided below, per week, from
     # the artifacts themselves — the only evidence that cannot be stale.
+    #
+    # ORDER BY b.id ascending is the tie-break, and it is deliberate: when the
+    # same book has been taught more than once, the earliest course wins. That
+    # is the one the most learners already hold, so a class converges on a
+    # single shared course instead of splintering every time an admin
+    # regenerates one learner's copy. Ordering by recency would hand each new
+    # learner whichever version happened to be rebuilt last.
     donors = fetch_all(
         """SELECT b.id, b.student_id, b.generation_total_weeks AS total_weeks,
                   b.generation_manifest, b.semester_plan
@@ -1185,7 +1201,7 @@ def find_reusable_course(
               AND b.status IN ('ready', 'partial')
               AND b.generation_total_weeks > 0
               AND b.semester_plan IS NOT NULL
-            ORDER BY b.id""",
+            ORDER BY b.id ASC""",
         (source_sha256, book_id),
     )
     for donor in donors or []:
@@ -1207,6 +1223,20 @@ def find_reusable_course(
             continue
         return donor
     return None
+
+
+def course_reuse_allowed(sid: str, *, quizzes_only: bool, no_reuse: bool) -> bool:
+    """Whether this run may take an existing course instead of writing one.
+
+    Reuse is right for a learner meeting a book someone else has already been
+    taught. It is wrong when an admin has explicitly asked to regenerate
+    (``--no-reuse``), because returning a copy would make that request a silent
+    no-op, and wrong when the learner reshaped their curriculum, because the
+    existing course no longer describes what they approved.
+    """
+    if quizzes_only or no_reuse:
+        return False
+    return not learner_has_edited_curriculum(sid)
 
 
 def learner_has_edited_curriculum(sid: str) -> bool:
@@ -1348,6 +1378,32 @@ def adopt_course(sid: str, book_id: int, donor: dict) -> int:
     return adopted
 
 
+def rekey_section_payload(
+    payload: dict,
+    *,
+    sid: str,
+    book_id: int,
+    topic_id: str,
+    programme_title: str,
+    plan_version: int,
+) -> dict:
+    """Make a copied pack describe the learner who is about to be taught it.
+
+    Live re-reads the pack's own identity and refuses when it disagrees with
+    the row it arrived in (protocols/section_session.py). Copying the payload
+    unchanged therefore produced a section that failed its own contract at join
+    time with ``section_artifact_unavailable`` — the columns said one learner
+    and the payload still said another.
+    """
+    rekeyed = dict(payload)
+    rekeyed["user_id"] = sid
+    rekeyed["course_id"] = f"book-{book_id}"
+    rekeyed["topic_id"] = topic_id
+    rekeyed["programme_title"] = programme_title
+    rekeyed["plan_version"] = str(plan_version)
+    return rekeyed
+
+
 def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
     """Re-key the donor's grounded sections onto this learner's approved plan.
 
@@ -1356,7 +1412,7 @@ def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
     or the app would never find it.
     """
     programme = fetch_one(
-        """SELECT id, plan_version FROM programmes
+        """SELECT id, name, plan_version FROM programmes
             WHERE student_id = %s AND status = 'approved'
             ORDER BY id DESC LIMIT 1""",
         (sid,),
@@ -1364,6 +1420,7 @@ def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
     if not programme:
         return
     programme_id = str(programme["id"])
+    programme_title = str(programme["name"])
     plan_version = int(programme["plan_version"])
     packs = fetch_all(
         """SELECT week, prompt_id, prompt_version, payload_hash, pack_payload
@@ -1375,6 +1432,17 @@ def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
         artifact = lecture_artifact(sid, week, book_id)
         if not artifact:
             continue
+        payload = rekey_section_payload(
+            pack["pack_payload"],
+            sid=sid,
+            book_id=book_id,
+            topic_id=str(artifact["artifact_id"]),
+            programme_title=programme_title,
+            plan_version=plan_version,
+        )
+        serialized = json.dumps(payload, ensure_ascii=False)
+        # The hash covers the payload as stored, so it has to follow the re-key.
+        payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         execute(
             """
             INSERT INTO section_packs
@@ -1405,8 +1473,8 @@ def adopt_section_packs(sid: str, book_id: int, donor_id: int) -> None:
                 plan_version,
                 pack["prompt_id"],
                 pack["prompt_version"],
-                pack["payload_hash"],
-                json.dumps(pack["pack_payload"], ensure_ascii=False),
+                payload_hash,
+                serialized,
             ),
         )
         mark_milestone(
@@ -1543,12 +1611,18 @@ def main() -> int:
     if len(sys.argv) < 3:
         print(json.dumps({
             "ok": False,
-            "error": "usage: lecture_gen.py <pdf_path> <book_id> [--quizzes-only|--plan-only]",
+            "error": (
+                "usage: lecture_gen.py <pdf_path> <book_id> "
+                "[--quizzes-only|--plan-only] [--no-reuse]"
+            ),
         }))
         return 2
     pdf_path = Path(sys.argv[1]).resolve()
     book_id = int(sys.argv[2])
     quizzes_only = "--quizzes-only" in sys.argv[3:]
+    # Write this book's course even if an identical one already exists. The
+    # admin's "Regenerate course" asks for new content, not a copy of it.
+    no_reuse = "--no-reuse" in sys.argv[3:]
     # Discover the chapters and stop. The curriculum a learner approves is built
     # from semester-plan.json, so the plan has to exist before they can approve
     # anything — but writing lectures, quizzes, slides and voice for a course
@@ -1590,8 +1664,14 @@ def main() -> int:
         fingerprint = course_components().fingerprint()
         saved_manifest = book.get("generation_manifest")
         saved_total = int(book.get("generation_total_weeks") or 0)
+        # --no-reuse has to switch off resuming this book's OWN checkpoints too,
+        # not just adopting another learner's course. A finished book resumes
+        # every week from the artifacts it already has, so without this an
+        # admin's regeneration would skip straight past generation and rewrite
+        # nothing — the same silent no-op by a different route.
         published_course_resume = bool(
             not quizzes_only
+            and not no_reuse
             and saved_total > 0
             and int(book.get("generation_ready_weeks") or 0) >= saved_total
             and book.get("source_sha256") == source_sha256
@@ -1632,7 +1712,7 @@ def main() -> int:
             remove_obsolete_weeks(sid, total_weeks, book_id)
             resume_artifacts = prepare_generation_manifest(
                 sid, book_id, source_sha256, total_weeks, fingerprint
-            )
+            ) and not no_reuse
             execute(
                 """UPDATE books SET generation_total_weeks = %s,
                        generation_stage = 'content', error = NULL WHERE id = %s""",
@@ -1660,7 +1740,8 @@ def main() -> int:
         # learner already has a finished course from the same bytes and the same
         # pipeline, that course IS this course — writing it again would cost a
         # full run of model calls to arrive somewhere no better.
-        if not quizzes_only and not learner_has_edited_curriculum(sid):
+        #
+        if course_reuse_allowed(sid, quizzes_only=quizzes_only, no_reuse=no_reuse):
             plan_row = fetch_one("SELECT semester_plan FROM books WHERE id = %s", (book_id,))
             donor = find_reusable_course(
                 sid,
