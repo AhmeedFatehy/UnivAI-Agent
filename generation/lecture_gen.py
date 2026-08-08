@@ -910,6 +910,14 @@ def generate_and_store_section(
         lecture_title=lecture_title,
         created_at=datetime.now(timezone.utc).isoformat(),
     )
+    # The section practises what the lecture taught, so it is grounded on that
+    # lecture's own slide headings rather than on the week's title alone.
+    slides = artifact.get("slides_payload") or {}
+    topics = [
+        str(slide.get("heading") or "").strip()
+        for slide in (slides.get("slides") or [])
+        if isinstance(slide, dict) and str(slide.get("heading") or "").strip()
+    ]
     run = generate_section_pack(
         llm=lambda prompt: complete(
             prompt, system=_SECTION_PROMPT.system, max_tokens=4000
@@ -917,6 +925,7 @@ def generate_and_store_section(
         identity=identity,
         tool_context=ToolContext(),
         focus=focus,
+        topics=topics,
         on_call=lambda: progress(book_id, f"Writing grounded section {week}…"),
     )
     if run.section is None:
