@@ -1251,11 +1251,12 @@ def learner_has_edited_curriculum(sid: str) -> bool:
 
 
 def _reuse_slidev_cache(donor_artifact_id: str, artifact_id: str) -> bool:
-    """Hardlink a built deck to the adopting learner's artifact id.
+    """Copy a built deck and re-key its embedded base URL for the adopter.
 
-    Slidev output is immutable and rebuilt by replacement, so links are safe;
-    a filesystem that refuses them falls back to a copy. Returns False when the
-    donor has no build, leaving the deck to be compiled normally.
+    Slidev writes the artifact id into HTML and JavaScript assets. A byte-for-
+    byte copy therefore keeps requesting the donor's protected presentation,
+    which the adopting learner cannot access. Use independent files (not hard
+    links) so replacing that id never mutates the donor build.
     """
     donor_dir = _slidev_cache_dir(donor_artifact_id)
     if not (donor_dir / "index.html").is_file():
@@ -1265,14 +1266,18 @@ def _reuse_slidev_cache(donor_artifact_id: str, artifact_id: str) -> bool:
         shutil.rmtree(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.copytree(donor_dir, target, copy_function=os.link)
+        shutil.copytree(donor_dir, target)
+        donor_id = donor_artifact_id.encode("utf-8")
+        adopted_id = artifact_id.encode("utf-8")
+        for copied in target.rglob("*"):
+            if not copied.is_file():
+                continue
+            body = copied.read_bytes()
+            if donor_id in body:
+                copied.write_bytes(body.replace(donor_id, adopted_id))
     except OSError:
         shutil.rmtree(target, ignore_errors=True)
-        try:
-            shutil.copytree(donor_dir, target)
-        except OSError:
-            shutil.rmtree(target, ignore_errors=True)
-            return False
+        return False
     return (target / "index.html").is_file()
 
 

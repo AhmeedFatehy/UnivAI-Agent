@@ -208,6 +208,32 @@ def test_an_untouched_curriculum_may_adopt(monkeypatch):
     assert lecture_gen.learner_has_edited_curriculum("S-2026-000005") is False
 
 
+def test_reused_slidev_cache_is_rekeyed_without_mutating_donor(monkeypatch, tmp_path):
+    donor_id = "11111111-1111-4111-8111-111111111111"
+    adopted_id = "22222222-2222-4222-8222-222222222222"
+    monkeypatch.setattr(
+        lecture_gen, "_slidev_cache_dir", lambda artifact_id: tmp_path / artifact_id
+    )
+    donor = tmp_path / donor_id
+    (donor / "assets").mkdir(parents=True)
+    donor_index = f'<script src="/api/presentation/{donor_id}/assets/app.js"></script>'
+    donor_script = f'const base = "/api/presentation/{donor_id}/";'
+    (donor / "index.html").write_text(donor_index, encoding="utf-8")
+    (donor / "assets" / "app.js").write_text(donor_script, encoding="utf-8")
+    (donor / "assets" / "font.woff2").write_bytes(b"\x00\x01font")
+
+    assert lecture_gen._reuse_slidev_cache(donor_id, adopted_id) is True
+
+    adopted = tmp_path / adopted_id
+    assert donor_id not in (adopted / "index.html").read_text(encoding="utf-8")
+    assert donor_id not in (adopted / "assets" / "app.js").read_text(encoding="utf-8")
+    assert adopted_id in (adopted / "index.html").read_text(encoding="utf-8")
+    assert adopted_id in (adopted / "assets" / "app.js").read_text(encoding="utf-8")
+    assert (adopted / "assets" / "font.woff2").read_bytes() == b"\x00\x01font"
+    assert donor_id in (donor / "index.html").read_text(encoding="utf-8")
+    assert donor_id in (donor / "assets" / "app.js").read_text(encoding="utf-8")
+
+
 def test_adoption_copies_the_teaching_and_rekeys_the_identity(monkeypatch):
     """The lecture arrives byte-identical under the adopting learner's own id."""
     donor_week = {
