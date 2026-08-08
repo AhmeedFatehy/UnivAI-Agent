@@ -1218,6 +1218,20 @@ def find_reusable_course(
     return None
 
 
+def course_reuse_allowed(sid: str, *, quizzes_only: bool, no_reuse: bool) -> bool:
+    """Whether this run may take an existing course instead of writing one.
+
+    Reuse is right for a learner meeting a book someone else has already been
+    taught. It is wrong when an admin has explicitly asked to regenerate
+    (``--no-reuse``), because returning a copy would make that request a silent
+    no-op, and wrong when the learner reshaped their curriculum, because the
+    existing course no longer describes what they approved.
+    """
+    if quizzes_only or no_reuse:
+        return False
+    return not learner_has_edited_curriculum(sid)
+
+
 def learner_has_edited_curriculum(sid: str) -> bool:
     """A reshaped curriculum earns a real build, not somebody else's course."""
     programme = fetch_one(
@@ -1590,12 +1604,18 @@ def main() -> int:
     if len(sys.argv) < 3:
         print(json.dumps({
             "ok": False,
-            "error": "usage: lecture_gen.py <pdf_path> <book_id> [--quizzes-only|--plan-only]",
+            "error": (
+                "usage: lecture_gen.py <pdf_path> <book_id> "
+                "[--quizzes-only|--plan-only] [--no-reuse]"
+            ),
         }))
         return 2
     pdf_path = Path(sys.argv[1]).resolve()
     book_id = int(sys.argv[2])
     quizzes_only = "--quizzes-only" in sys.argv[3:]
+    # Write this book's course even if an identical one already exists. The
+    # admin's "Regenerate course" asks for new content, not a copy of it.
+    no_reuse = "--no-reuse" in sys.argv[3:]
     # Discover the chapters and stop. The curriculum a learner approves is built
     # from semester-plan.json, so the plan has to exist before they can approve
     # anything — but writing lectures, quizzes, slides and voice for a course
@@ -1637,8 +1657,14 @@ def main() -> int:
         fingerprint = course_components().fingerprint()
         saved_manifest = book.get("generation_manifest")
         saved_total = int(book.get("generation_total_weeks") or 0)
+        # --no-reuse has to switch off resuming this book's OWN checkpoints too,
+        # not just adopting another learner's course. A finished book resumes
+        # every week from the artifacts it already has, so without this an
+        # admin's regeneration would skip straight past generation and rewrite
+        # nothing — the same silent no-op by a different route.
         published_course_resume = bool(
             not quizzes_only
+            and not no_reuse
             and saved_total > 0
             and int(book.get("generation_ready_weeks") or 0) >= saved_total
             and book.get("source_sha256") == source_sha256
@@ -1679,7 +1705,7 @@ def main() -> int:
             remove_obsolete_weeks(sid, total_weeks, book_id)
             resume_artifacts = prepare_generation_manifest(
                 sid, book_id, source_sha256, total_weeks, fingerprint
-            )
+            ) and not no_reuse
             execute(
                 """UPDATE books SET generation_total_weeks = %s,
                        generation_stage = 'content', error = NULL WHERE id = %s""",
@@ -1707,7 +1733,8 @@ def main() -> int:
         # learner already has a finished course from the same bytes and the same
         # pipeline, that course IS this course — writing it again would cost a
         # full run of model calls to arrive somewhere no better.
-        if not quizzes_only and not learner_has_edited_curriculum(sid):
+        #
+        if course_reuse_allowed(sid, quizzes_only=quizzes_only, no_reuse=no_reuse):
             plan_row = fetch_one("SELECT semester_plan FROM books WHERE id = %s", (book_id,))
             donor = find_reusable_course(
                 sid,

@@ -128,6 +128,49 @@ def test_a_learner_without_a_plan_yet_is_not_adopted(monkeypatch):
     )
 
 
+def test_regeneration_refuses_to_hand_back_an_existing_course(monkeypatch):
+    """An admin's "Regenerate course" must write the book again.
+
+    Reuse turned that request into a no-op: the book was adopted from an
+    identical course, so regenerating found the same donor and copied it back.
+    Observed as "4/4 lectures reused from an identical book" in answer to a
+    rebuild.
+    """
+    monkeypatch.setattr(
+        lecture_gen, "fetch_one", lambda sql, params=None: {"plan_version": 1}
+    )
+
+    assert lecture_gen.course_reuse_allowed(
+        "S-2026-000005", quizzes_only=False, no_reuse=False
+    ) is True
+    assert lecture_gen.course_reuse_allowed(
+        "S-2026-000005", quizzes_only=False, no_reuse=True
+    ) is False
+
+
+def test_an_edited_curriculum_is_never_reused_even_without_the_flag(monkeypatch):
+    monkeypatch.setattr(
+        lecture_gen, "fetch_one", lambda sql, params=None: {"plan_version": 2}
+    )
+
+    assert lecture_gen.course_reuse_allowed(
+        "S-2026-000005", quizzes_only=False, no_reuse=False
+    ) is False
+
+
+def test_a_quiz_only_run_never_adopts(monkeypatch):
+    """It rewrites question banks in place; there is no course to take."""
+    monkeypatch.setattr(
+        lecture_gen,
+        "fetch_one",
+        lambda sql, params=None: pytest.fail("quizzes-only must not query the curriculum"),
+    )
+
+    assert lecture_gen.course_reuse_allowed(
+        "S-2026-000005", quizzes_only=True, no_reuse=False
+    ) is False
+
+
 def test_an_edited_curriculum_earns_a_real_build(monkeypatch):
     monkeypatch.setattr(
         lecture_gen, "fetch_one", lambda sql, params=None: {"plan_version": 2}
