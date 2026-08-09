@@ -82,6 +82,11 @@ services are missing and never falls back to fixtures.
 - the UnivAI app's upload flow (`ingest_file`, and cleanup on book replacement)
 - the live-lecture voice agent (`retrieve_context` for raised-hand questions)
 
+Generated presentations use the bounded visual vocabulary documented in
+[`docs/slide-generation-contract.md`](docs/slide-generation-contract.md). The
+model supplies semantic JSON; repository-owned code compiles it safely to
+Slidev.
+
 ## Contracts and safety
 
 `contracts.py` owns the MCP tool list, course-size table, and script/quiz

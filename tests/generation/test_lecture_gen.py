@@ -93,7 +93,11 @@ def test_short_final_batch_accepts_its_requested_size():
         "slides": [
             {
                 "heading": "Last point",
+                "layout": "concept",
                 "bullets": ["One", "Two"],
+                "callout": "",
+                "emphasis": [],
+                "visual": {},
                 "narration": (
                     "This narration deliberately contains enough spoken words to pass the structural "
                     "validation check for a generated slide."
@@ -179,10 +183,10 @@ def test_slidev_markdown_is_derived_from_the_database_deck():
     })
 
     assert "theme: default" in rendered
-    assert "# Reliable Systems" in rendered
-    assert "# Reliability" in rendered
-    assert "- Tolerate faults" in rendered
-    assert "Source: p.17" in rendered
+    assert '<h1>Reliable Systems</h1>' in rendered
+    assert '<h1 class="ua-heading">Reliability</h1>' in rendered
+    assert "Tolerate faults" in rendered
+    assert "SOURCE&nbsp;&middot;&nbsp;P.17" in rendered
 
 
 def test_lecture_write_lets_postgres_generate_the_public_artifact_id(monkeypatch):
@@ -209,3 +213,8 @@ def test_lecture_write_lets_postgres_generate_the_public_artifact_id(monkeypatch
     assert "INSERT INTO lecture_artifacts" in sql
     assert params[:4] == (7, "student-1", 1, "Opaque identifiers")
     assert all("week-1" not in str(value) for value in params)
+    saved_lecture = json.loads(params[4])
+    saved_deck = json.loads(params[6])
+    assert saved_lecture["slides"][0]["layout"] == "concept"
+    assert saved_deck["slides"][0]["layout"] == "concept"
+    assert saved_deck["slides"][0]["visual"] == {}

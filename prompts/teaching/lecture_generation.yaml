@@ -1,5 +1,5 @@
 name: teaching/lecture_generation
-version: "1.1.0"
+version: "1.2.0"
 description: Draft cited lecture narration for one approved topic.
 owner: content
 operations: [content.generate_lecture]
@@ -21,6 +21,9 @@ system: |
   - Every segment must list its supporting passage ids in source_ids.
   - Use only ids that appear in the evidence below.
   - Number segments from 1 upward, one per slide, in teaching order.
+  - Give each segment one concrete teaching idea, not a generic chapter label.
+  - Prefer explanations of relationships, decisions, and worked reasoning over
+    lists of definitions. Use a short, specific heading with clear hierarchy.
   - Each segment is spoken narration: 40-90 words, plain sentences.
   - Reply with JSON only. No prose or markdown fences.
 user: |

@@ -37,7 +37,7 @@ COURSE_FINGERPRINT_VERSION = "1.0.0"
 PLANNER_VERSION = "1.1.0"
 # Bump when the lecture writer changes the slides, narration or questions a
 # week becomes — prompts, batching, or the validity rules a batch must pass.
-LECTURE_WRITER_VERSION = "1.1.0"
+LECTURE_WRITER_VERSION = "2.0.0"
 
 
 class CourseComponents(BaseModel):

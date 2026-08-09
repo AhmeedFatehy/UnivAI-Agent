@@ -51,6 +51,12 @@ from planning.semester_planner import (
 )
 from generation.course_identity import CourseComponents
 from generation.section_gen import generate_section_pack
+from generation.slide_design import (
+    SLIDE_DESIGN_INSTRUCTIONS,
+    batch_design_problem,
+    normalise_slide,
+    render_slidev_markdown,
+)
 from planning.section_planner import SectionIdentity
 from tools.registry import ToolContext
 
@@ -518,7 +524,7 @@ def check_lecture(
                 f"{where} has {spoken}-word narration; rewrite only that slide's "
                 "narration so it is at least 15 spoken words. Leave the others as they are."
             )
-        if not isinstance(slide.get("page"), int):
+        if not isinstance(slide.get("page"), int) or isinstance(slide.get("page"), bool):
             return f"{where} needs the page number it came from"
     # Only the opening batch introduces the lecture; the ones that continue it
     # are told to leave intro empty so the lecturer does not greet the room
@@ -628,11 +634,14 @@ def _generate_batch(
         '  "title": "short lecture title",\n'
         + intro_line
         + '  "slides": [\n'
-        '    {"heading": "...", "bullets": ["...", "...", "..."], '
+        '    {"heading": "...", "layout": "concept", "bullets": ["...", "..."], '
+        '"callout": "", "emphasis": [], "visual": {}, '
         f'"narration": "{narration} spoken sentences explaining this slide", "page": <page number the content came from>}}\n'
         "  ]\n"
         "}\n\n"
-        f"Rules: exactly {slides} slides. Bullets are short phrases (under 12 words). "
+        + SLIDE_DESIGN_INSTRUCTIONS
+        + "\n"
+        f"Rules: exactly {slides} slides. Bullets are short phrases. "
         "Narration is natural speech - no bullet symbols, no 'as you can see'. "
         f'"page" must be one of {valid_pages}.\n\n'
         "Textbook pages:\n" + source_block(pages)
@@ -643,7 +652,16 @@ def _generate_batch(
     # "Lecture 2: Consistency Models" — the deck already says Week N, and the
     # colon broke the deck's YAML headmatter once. Strip the redundant prefix.
     data["title"] = re.sub(r"^Lecture\s*\d+\s*[:\-–—]\s*", "", data["title"].strip())
-    data["slides"] = data["slides"][:slides]
+    design_problem = batch_design_problem(data["slides"][:slides])
+    if design_problem:
+        # Visual polish must never make grounded teaching content unavailable.
+        # The normalizer below reduces malformed optional visuals to a safe,
+        # readable concept/card layout and keeps narration and citations.
+        print(f"[lecture-gen]   visual fallback: {design_problem}", flush=True)
+    data["slides"] = [
+        normalise_slide(slide, position)
+        for position, slide in enumerate(data["slides"][:slides], start=1)
+    ]
     for slide in data["slides"]:
         # never trust a model with page numbers: clamp to the pages it was shown
         if slide["page"] not in valid_pages:
@@ -791,6 +809,12 @@ def write_lecture(
         raise RuntimeError("database is not loaded")
     resolved_book_id = _book_for_student(sid, book_id)
     title = lecture["title"].strip()
+    normalised_slides = [
+        normalise_slide(slide, index)
+        for index, slide in enumerate(lecture["slides"], start=1)
+    ]
+    safe_lecture = deepcopy(lecture)
+    safe_lecture["slides"] = normalised_slides
     slides = {
         "week": week,
         "title": title,
@@ -799,15 +823,19 @@ def write_lecture(
                 "slide": index + 2,
                 "heading": slide["heading"].strip(),
                 "bullets": [bullet.strip() for bullet in slide["bullets"]],
+                "layout": slide["layout"],
+                "callout": slide["callout"],
+                "emphasis": slide["emphasis"],
+                "visual": slide["visual"],
                 "page": slide["page"],
             }
-            for index, slide in enumerate(lecture["slides"])
+            for index, slide in enumerate(normalised_slides)
         ],
     }
     segments = [
-        {"slide": 1, "text": lecture["intro"].strip(), "citations": [{"page": lecture["slides"][0]["page"]}]}
+        {"slide": 1, "text": lecture["intro"].strip(), "citations": [{"page": normalised_slides[0]["page"]}]}
     ]
-    for index, slide in enumerate(lecture["slides"]):
+    for index, slide in enumerate(normalised_slides):
         segments.append(
             {
                 "slide": index + 2,
@@ -844,7 +872,7 @@ def write_lecture(
             sid,
             week,
             title,
-            json.dumps(lecture, ensure_ascii=False),
+            json.dumps(safe_lecture, ensure_ascii=False),
             json.dumps(script, ensure_ascii=False),
             json.dumps(slides, ensure_ascii=False),
         ),
@@ -1025,27 +1053,7 @@ def _slidev_cache_dir(artifact_id: str) -> Path:
 
 def _slidev_markdown(deck: dict) -> str:
     """Compile the database deck into Slidev input without making it canonical."""
-    title = str(deck["title"]).strip()
-    pages = [
-        "---\n"
-        "theme: default\n"
-        f"title: {json.dumps(title, ensure_ascii=False)}\n"
-        "transition: slide-left\n"
-        "mdc: true\n"
-        "---\n\n"
-        f"# {title}\n\n"
-        f"Week {int(deck['week'])}\n"
-    ]
-    for slide in deck["slides"]:
-        heading = str(slide["heading"]).strip().replace("\n", " ")
-        bullets = [str(item).strip().replace("\n", " ") for item in slide["bullets"]]
-        body = "\n".join(f"- {bullet}" for bullet in bullets if bullet)
-        pages.append(
-            "---\nlayout: default\n---\n\n"
-            f"# {heading}\n\n{body}\n\n"
-            f"<div class=\"absolute bottom-6 right-8 opacity-60\">Source: p.{int(slide['page'])}</div>\n"
-        )
-    return "\n".join(pages)
+    return render_slidev_markdown(deck)
 
 
 def build_slides(sid: str, week: int | None = None, book_id: int | None = None) -> None:
