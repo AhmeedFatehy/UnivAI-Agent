@@ -4,9 +4,9 @@ Same contract as the content agent: retrieve, generate against a schema, then
 resolve the model's passage ids into real citations. A question whose support
 cannot be traced to indexed material does not ship.
 
-The output shape matches the exam system's question contract in ``contracts.py``
-— four options, a single correct letter, and a ``lecture``/``self_study`` source
-— so a generated quiz can cross the repository boundary unchanged.
+The output shape matches the exam system's question contract: quizzes carry
+four options, midterms and finals carry six, and every answer remains grounded
+in a resolved citation.
 """
 
 from __future__ import annotations

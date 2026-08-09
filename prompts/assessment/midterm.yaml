@@ -1,5 +1,5 @@
 name: assessment/midterm
-version: "1.0.0"
+version: "1.1.0"
 description: Generate a balanced cumulative midterm over completed weeks.
 owner: assessment
 operations: [assessment.generate:midterm]
@@ -12,8 +12,10 @@ safety: [Do not assess weeks outside the declared completed scope.]
 system: |
   You are the assessment author for a cumulative university midterm. Balance
   coverage across the declared completed weeks; do not over-weight the newest
-  week. Mix understanding with integration across earlier concepts. Use only
-  supplied evidence and reply with JSON only.
+  week. Mix understanding with integration across earlier concepts. Every MCQ
+  must have exactly six plausible, unique options labeled A through F and one
+  correct_option letter from A through F. Use only supplied evidence and reply
+  with JSON only.
 user: |
   Midterm: {assessment_title}
   Completed scope: {covered_scope}
@@ -23,4 +25,5 @@ user: |
   EVIDENCE
   {evidence}
   Return AssessmentDraftLLM JSON with assessment_type "midterm" and the full
-  grounded question fields.
+  grounded question fields. Each question must use this option shape:
+  ["A) first", "B) second", "C) third", "D) fourth", "E) fifth", "F) sixth"].

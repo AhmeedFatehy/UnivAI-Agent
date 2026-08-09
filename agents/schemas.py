@@ -262,8 +262,8 @@ class LectureDraftLLM(BaseModel):
 
 class DraftQuestion(BaseModel):
     prompt: str = Field(min_length=1)
-    options: list[str] = Field(min_length=4, max_length=4)
-    correct_option: Literal["A", "B", "C", "D"]
+    options: list[str] = Field(min_length=4, max_length=6)
+    correct_option: Literal["A", "B", "C", "D", "E", "F"]
     source: Literal["lecture", "self_study"] = "lecture"
     source_ids: list[str] = Field(min_length=1)
     difficulty: int = Field(default=2, ge=1, le=5)
@@ -276,10 +276,39 @@ class DraftQuestion(BaseModel):
     def _passage_ids(cls, values: list[str]) -> list[str]:
         return clean_passage_ids(values)
 
+    @field_validator("options")
+    @classmethod
+    def _unique_nonblank_options(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("answer options cannot be blank")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("answer options must be unique")
+        return cleaned
+
 
 class AssessmentDraftLLM(BaseModel):
     assessment_type: AssessmentType = AssessmentType.QUIZ
     questions: list[DraftQuestion] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _assessment_option_contract(self):
+        expected = 6 if self.assessment_type in {
+            AssessmentType.MIDTERM,
+            AssessmentType.FINAL,
+        } else 4
+        allowed_labels = set("ABCDEF"[:expected])
+        for question in self.questions:
+            if len(question.options) != expected:
+                raise ValueError(
+                    f"{self.assessment_type.value} questions require exactly "
+                    f"{expected} answer options"
+                )
+            if question.correct_option not in allowed_labels:
+                raise ValueError(
+                    f"correct_option must be one of {''.join(sorted(allowed_labels))}"
+                )
+        return self
 
 
 class AnswerExplanationLLM(BaseModel):
@@ -387,14 +416,24 @@ class Lecture(BaseModel):
 
 class AssessmentQuestion(BaseModel):
     prompt: str
-    options: list[str] = Field(min_length=4, max_length=4)
-    correct_option: Literal["A", "B", "C", "D"]
+    options: list[str] = Field(min_length=4, max_length=6)
+    correct_option: Literal["A", "B", "C", "D", "E", "F"]
     source: Literal["lecture", "self_study"]
     citations: list[SourceLocation] = Field(min_length=1)
     difficulty: int = Field(default=2, ge=1, le=5)
     learning_objectives: list[str] = Field(default_factory=list)
     rubric: list[str] = Field(default_factory=list)
     follow_up_prompts: list[str] = Field(default_factory=list)
+
+    @field_validator("options")
+    @classmethod
+    def _unique_nonblank_options(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("answer options cannot be blank")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("answer options must be unique")
+        return cleaned
 
 
 class Assessment(BaseModel):
@@ -403,6 +442,25 @@ class Assessment(BaseModel):
     assessment_type: AssessmentType = AssessmentType.QUIZ
     covered_scope: list[str] = Field(default_factory=list)
     questions: list[AssessmentQuestion] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _assessment_option_contract(self):
+        expected = 6 if self.assessment_type in {
+            AssessmentType.MIDTERM,
+            AssessmentType.FINAL,
+        } else 4
+        allowed_labels = set("ABCDEF"[:expected])
+        for question in self.questions:
+            if len(question.options) != expected:
+                raise ValueError(
+                    f"{self.assessment_type.value} questions require exactly "
+                    f"{expected} answer options"
+                )
+            if question.correct_option not in allowed_labels:
+                raise ValueError(
+                    f"correct_option must be one of {''.join(sorted(allowed_labels))}"
+                )
+        return self
 
 
 class SectionActivity(BaseModel):

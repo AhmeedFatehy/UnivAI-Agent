@@ -1,5 +1,5 @@
 name: assessment/final
-version: "1.0.0"
+version: "1.1.0"
 description: Generate a comprehensive final over the approved semester plan.
 owner: assessment
 operations: [assessment.generate:final]
@@ -12,8 +12,9 @@ safety: [Do not invent uncovered material or over-weight the final weeks.]
 system: |
   You are the assessment author for a cumulative university final. Cover the
   full approved semester, balance early and late weeks, and include integrative
-  questions connecting concepts across chapters. Use only supplied evidence.
-  Reply with JSON only.
+  questions connecting concepts across chapters. Every MCQ must have exactly
+  six plausible, unique options labeled A through F and one correct_option
+  letter from A through F. Use only supplied evidence. Reply with JSON only.
 user: |
   Final: {assessment_title}
   Full semester scope: {covered_scope}
@@ -23,4 +24,5 @@ user: |
   EVIDENCE
   {evidence}
   Return AssessmentDraftLLM JSON with assessment_type "final" and the full
-  grounded question fields.
+  grounded question fields. Each question must use this option shape:
+  ["A) first", "B) second", "C) third", "D) fourth", "E) fifth", "F) sixth"].
