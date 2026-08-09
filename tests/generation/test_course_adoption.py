@@ -25,6 +25,7 @@ def donor_row(**overrides) -> dict:
     row = {
         "id": 7,
         "student_id": "S-2026-000004",
+        "pages": 320,
         "total_weeks": 2,
         "generation_manifest": {"course_fingerprint": FINGERPRINT},
         "semester_plan": PLAN,
@@ -140,13 +141,15 @@ def test_an_unfinished_donor_is_not_adopted(monkeypatch):
     )
 
 
-def test_a_learner_without_a_plan_yet_is_not_adopted(monkeypatch):
+def test_a_learner_without_a_plan_reuses_the_finished_donors_plan(monkeypatch):
     install_db(monkeypatch, donors=[donor_row()])
 
-    assert (
-        lecture_gen.find_reusable_course("S-2026-000005", 8, "sha-abc", FINGERPRINT, None)
-        is None
+    donor = lecture_gen.find_reusable_course(
+        "S-2026-000005", 8, "sha-abc", FINGERPRINT, None
     )
+
+    assert donor is not None
+    assert donor["semester_plan"] == PLAN
 
 
 def test_regeneration_refuses_to_hand_back_an_existing_course(monkeypatch):

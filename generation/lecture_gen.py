@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1165,6 +1166,22 @@ def prepare_generation_manifest(
 # and stay the learner's own, which is the whole point of separating them.
 
 
+def normalize_reused_plan(plan: dict) -> dict:
+    """Upgrade reusable plan metadata without changing its teaching weeks."""
+    normalized = deepcopy(plan)
+    for semester in normalized.get("semesters") or []:
+        week_count = int(semester.get("week_count") or 0)
+        if week_count < 1:
+            continue
+        midpoint = (week_count + 1) // 2
+        semester["midterms"] = [{
+            "number": 1,
+            "after_week": midpoint,
+            "covers_weeks": list(range(1, midpoint + 1)),
+        }]
+    return normalized
+
+
 def find_reusable_course(
     sid: str,
     book_id: int,
@@ -1179,8 +1196,6 @@ def find_reusable_course(
     prompts or lecture shape moved on, and a different semester plan means the
     weeks would not line up with the curriculum this learner approved.
     """
-    if not semester_plan:
-        return None
     # 'partial' is a statement about narration bookkeeping, not about teaching:
     # a course whose weeks are all written sits at 'partial' until its audio
     # counters agree. Completeness is therefore decided below, per week, from
@@ -1193,7 +1208,8 @@ def find_reusable_course(
     # regenerates one learner's copy. Ordering by recency would hand each new
     # learner whichever version happened to be rebuilt last.
     donors = fetch_all(
-        """SELECT b.id, b.student_id, b.generation_total_weeks AS total_weeks,
+        """SELECT b.id, b.student_id, b.pages,
+                  b.generation_total_weeks AS total_weeks,
                   b.generation_manifest, b.semester_plan
              FROM books b
             WHERE b.source_sha256 = %s
@@ -1208,7 +1224,11 @@ def find_reusable_course(
         manifest = donor.get("generation_manifest") or {}
         if manifest.get("course_fingerprint") != course_fingerprint:
             continue
-        if donor.get("semester_plan") != semester_plan:
+        if (
+            semester_plan is not None
+            and normalize_reused_plan(donor.get("semester_plan") or {})
+            != normalize_reused_plan(semester_plan)
+        ):
             continue
         total_weeks = int(donor.get("total_weeks") or 0)
         complete_weeks = fetch_one(
@@ -1684,6 +1704,18 @@ def main() -> int:
             and saved_manifest.get("source_sha256") == source_sha256
             and book.get("semester_plan")
         )
+        reusable_donor = None
+        if (
+            not published_course_resume
+            and course_reuse_allowed(sid, quizzes_only=quizzes_only, no_reuse=no_reuse)
+        ):
+            reusable_donor = find_reusable_course(
+                sid,
+                book_id,
+                source_sha256,
+                fingerprint,
+                book.get("semester_plan"),
+            )
 
         if published_course_resume:
             total_weeks = saved_total
@@ -1693,6 +1725,34 @@ def main() -> int:
             message = f"Reusing {total_weeks} published lecture checkpoints…"
             update_book_state(book_id, "generating", "resuming", message)
             progress(book_id, message)
+            initialize_milestones(book_id, sid, total_weeks)
+        elif reusable_donor:
+            # The bytes and complete pipeline fingerprint match a finished
+            # course. Reuse its verified plan directly: no PDF parsing, chapter
+            # discovery, or planning work is repeated for this learner.
+            plan = SemesterWeekPlan.model_validate(
+                normalize_reused_plan(reusable_donor["semester_plan"])
+            )
+            weeks = []
+            total_weeks = plan.week_count
+            page_count = int(reusable_donor.get("pages") or 0)
+            message = f"Found this book already taught — reusing its {total_weeks}-week plan…"
+            update_book_state(book_id, "generating", "planning", message)
+            progress(book_id, message)
+            execute(
+                "UPDATE books SET pages = %s, source_sha256 = %s WHERE id = %s",
+                (page_count, source_sha256, book_id),
+            )
+            write_semester_plan(sid, plan, book_id)
+            remove_obsolete_weeks(sid, total_weeks, book_id)
+            resume_artifacts = prepare_generation_manifest(
+                sid, book_id, source_sha256, total_weeks, fingerprint
+            ) and not no_reuse
+            execute(
+                """UPDATE books SET generation_total_weeks = %s,
+                       generation_stage = 'content', error = NULL WHERE id = %s""",
+                (total_weeks, book_id),
+            )
             initialize_milestones(book_id, sid, total_weeks)
         else:
             update_book_state(book_id, "generating", "reading", "Reading the book…")
@@ -1748,11 +1808,8 @@ def main() -> int:
         #
         if course_reuse_allowed(sid, quizzes_only=quizzes_only, no_reuse=no_reuse):
             plan_row = fetch_one("SELECT semester_plan FROM books WHERE id = %s", (book_id,))
-            donor = find_reusable_course(
-                sid,
-                book_id,
-                source_sha256,
-                fingerprint,
+            donor = reusable_donor or find_reusable_course(
+                sid, book_id, source_sha256, fingerprint,
                 (plan_row or {}).get("semester_plan"),
             )
             if donor:

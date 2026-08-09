@@ -198,10 +198,10 @@ def test_book_without_a_toc_has_an_explicit_low_confidence_fallback():
 @pytest.mark.parametrize(
     ("chapter_count", "semester_weeks", "quiz_counts", "midterm_counts"),
     [
-        (8, [8], [8], [2]),
-        (12, [8], [8], [2]),
-        (20, [12], [12], [3]),
-        (30, [12, 12], [12, 12], [3, 3]),
+        (8, [8], [8], [1]),
+        (12, [8], [8], [1]),
+        (20, [12], [12], [1]),
+        (30, [12, 12], [12, 12], [1, 1]),
     ],
 )
 def test_canonical_course_shapes(
@@ -217,6 +217,10 @@ def test_canonical_course_shapes(
     assert [semester.week_count for semester in plan.semesters] == semester_weeks
     assert [semester.quiz_count for semester in plan.semesters] == quiz_counts
     assert [len(semester.midterms) for semester in plan.semesters] == midterm_counts
+    assert all(
+        semester.midterms[0].after_week == (semester.week_count + 1) // 2
+        for semester in plan.semesters
+    )
     assert all(semester.final_after_week == semester.week_count for semester in plan.semesters)
     assert sum(len(week.chapters) for week in plan.weeks) == chapter_count
 

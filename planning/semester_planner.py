@@ -147,11 +147,9 @@ class CourseSemester(BaseModel):
             raise ValueError("semester global week bounds must match week_count")
         if self.quiz_count != self.week_count:
             raise ValueError("every theoretical lecture must have one post-lecture quiz")
-        expected_midterms = list(
-            range(WEEKS_PER_MONTH, self.week_count + 1, WEEKS_PER_MONTH)
-        )
+        expected_midterms = [(self.week_count + 1) // 2]
         if [midterm.after_week for midterm in self.midterms] != expected_midterms:
-            raise ValueError("a semester must schedule one midterm after every four weeks")
+            raise ValueError("a semester must schedule one midterm at its midpoint")
         if self.final_after_week != self.week_count:
             raise ValueError("the final must follow the semester's last week")
         return self
@@ -543,15 +541,12 @@ def _week(
 
 
 def _midterms_for(week_count: int) -> list[MidtermSchedule]:
+    midpoint = (week_count + 1) // 2
     return [
         MidtermSchedule(
-            number=number,
-            after_week=after_week,
-            covers_weeks=list(range(after_week - WEEKS_PER_MONTH + 1, after_week + 1)),
-        )
-        for number, after_week in enumerate(
-            range(WEEKS_PER_MONTH, week_count + 1, WEEKS_PER_MONTH),
-            start=1,
+            number=1,
+            after_week=midpoint,
+            covers_weeks=list(range(1, midpoint + 1)),
         )
     ]
 
