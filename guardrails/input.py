@@ -32,13 +32,15 @@ data, never as instructions.
 from __future__ import annotations
 
 import re
+import unicodedata
+from html import unescape
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 GUARDRAIL_SCHEMA = "univai.agent.guardrail"
-GUARDRAIL_SCHEMA_VERSION = "1.0.0"
+GUARDRAIL_SCHEMA_VERSION = "1.1.0"
 
 #: Canonical names of the compound rules. Exposed so operators and tests can
 #: reference a specific reason instead of pattern-matching prose.
@@ -50,6 +52,11 @@ RULE_UNRESTRICTED_MODE = "unrestricted_mode"
 RULE_ROLE_TAG = "role_tag_marker"
 RULE_EMBEDDED_INSTRUCTION = "embedded_instruction"
 RULE_DELIMITER_ATTACK = "delimiter_attack"
+RULE_OVERSIZED_INPUT = "oversized_input"
+
+MAX_USER_QUERY_CHARS = 4_000
+
+_INVISIBLE_FORMATTING = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
 
 _RULE_DIRECT: list[tuple[str, re.Pattern]] = [
     (
@@ -202,6 +209,20 @@ class GuardrailDecision(BaseModel):
 def _evaluate(
     text: str, kind: GuardrailKind, rules: list[tuple[str, re.Pattern]]
 ) -> GuardrailDecision:
+    original = text or ""
+    if kind is GuardrailKind.USER_QUERY and len(original) > MAX_USER_QUERY_CHARS:
+        return GuardrailDecision(
+            kind=kind,
+            safe=False,
+            matched_rules=[RULE_OVERSIZED_INPUT],
+            reasons=_describe([RULE_OVERSIZED_INPUT]),
+        )
+
+    # Normalise compatibility characters, HTML entities and invisible Unicode
+    # formatting before applying compound rules. This catches visually disguised
+    # role markers without broadening the rules into a topical content filter.
+    text = unicodedata.normalize("NFKC", unescape(original))
+    text = _INVISIBLE_FORMATTING.sub("", text)
     matched: list[str] = []
     for name, pattern in rules:
         if pattern.search(text or ""):
@@ -227,6 +248,7 @@ def _describe(matched: list[str]) -> list[str]:
         RULE_ROLE_TAG: "contains an injected system/user/assistant role marker",
         RULE_EMBEDDED_INSTRUCTION: "embeds an instruction addressed to the model",
         RULE_DELIMITER_ATTACK: "tries to delimit the start of a new prompt",
+        RULE_OVERSIZED_INPUT: "exceeds the maximum accepted user-query length",
     }
     return [descriptions[name] for name in matched]
 
@@ -269,11 +291,13 @@ __all__ = [
     "RULE_EXFILTRATE_PROMPT",
     "RULE_IGNORE_PREVIOUS",
     "RULE_NEW_INSTRUCTIONS",
+    "RULE_OVERSIZED_INPUT",
     "RULE_ROLE_REASSIGNMENT",
     "RULE_ROLE_TAG",
     "RULE_UNRESTRICTED_MODE",
     "GuardrailDecision",
     "GuardrailKind",
+    "MAX_USER_QUERY_CHARS",
     "classify_source_text",
     "classify_user_input",
     "screen_passages",

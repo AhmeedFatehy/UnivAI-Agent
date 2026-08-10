@@ -17,6 +17,7 @@ from document_processing.metadata import (
     PAYLOAD_COLLECTION_ID,
     PAYLOAD_DOCUMENT_ID,
 )
+from guardrails.prompt_boundary import quote_untrusted_data
 from retrieval.hybrid_search import hybrid_search_rrf
 from retrieval.reranker import rerank
 from retrieval.query_transform import decompose_query
@@ -79,7 +80,7 @@ def retrieve(
     # Step 1: Query transformation
     if use_query_transform:
         queries = decompose_query(query)
-        logger.info("Query decomposed into %d sub-queries: %s", len(queries), queries)
+        logger.info("Query decomposed into %d bounded sub-queries", len(queries))
     else:
         queries = [query]
 
@@ -233,9 +234,14 @@ def retrieve_formatted(
 
     parts = []
     for doc in docs:
+        # This legacy string form can be returned as an MCP tool result. Keep
+        # both source metadata and content in an explicit data boundary instead
+        # of exposing raw retrieved text as apparent instructions.
         parts.append(
-            f"{doc['citation']}\n"
-            f"Content: {doc['content']}"
+            quote_untrusted_data(
+                {"citation": doc["citation"], "content": doc["content"]},
+                label="retrieved-passage",
+            )
         )
 
     return "\n\n---\n\n".join(parts)

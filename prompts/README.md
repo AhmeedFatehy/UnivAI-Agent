@@ -4,6 +4,26 @@ All UnivAI Agent system prompts live in this folder. Python code selects a
 prompt by `PromptOperation`; it must not choose a YAML filename directly.
 `registry.yaml` is the single operation-to-prompt map.
 
+## Trust boundary
+
+Every value interpolated by `PromptTemplate` is **untrusted by default**. The
+renderer places it in a length-bounded, HTML-escaped `<untrusted-data>` block,
+so a book title, learner query, retrieved passage, repair reply, or JSON fragment
+cannot close its delimiter and become application instructions.
+
+The versioned policy in `guardrails/prompt_boundary.py` is attached to every
+system prompt. Production adapters recover the system and user parts and send
+them with real chat roles. Only deterministic application values that are
+already structurally isolated may appear in a template's optional
+`trusted_variables` list. Never mark book, learner, RAG, metadata, tool-result,
+or prior-model-output fields trusted.
+
+Regex screening is an entry-point signal, not the sole defence. Legitimate
+course material about prompts and attacks remains usable as quoted data.
+Security also depends on least-privilege tools, tenant identity bound outside
+the model, strict output schemas, grounded citations, bounded repair, and safe
+failure.
+
 ## Folder map
 
 | Folder | Used for |
@@ -71,6 +91,8 @@ content.
 3. Map the operation to the prompt ID in `registry.yaml`.
 4. Load it with `load_prompt_for(PromptOperation.…)` in the caller.
 5. Add or update a test and run `uv run pytest -q`.
+6. Keep all dynamic placeholders in `user`; catalog loading rejects dynamic
+   values interpolated into `system` instructions.
 
 `validate_prompt_catalog()` fails if an enum operation has no route, a prompt
 ID has no route, a YAML file is missing or extra, two prompts claim the same

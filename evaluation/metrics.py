@@ -24,6 +24,7 @@ from typing import Callable, Sequence
 from pydantic import BaseModel, Field, field_validator
 
 from agents.prompts import PromptOperation, load_prompt_for
+from guardrails.prompt_boundary import split_prompt_roles
 
 logger = logging.getLogger(__name__)
 
@@ -128,15 +129,15 @@ def parse_judge_output(raw: str) -> JudgeScores:
     Raises :class:`JudgeOutputError` for non-JSON replies, non-numeric scores,
     or scores outside 0..1. A malformed reply is a failure, never a zero.
     """
-    from agents.schemas import extract_json
+    from agents.schemas import strict_json_document
 
     text = (raw or "").strip()
     if not text:
         raise JudgeOutputError("judge returned an empty reply")
 
     try:
-        payload = json.loads(extract_json(text))
-    except (json.JSONDecodeError, TypeError) as error:
+        payload = json.loads(strict_json_document(text))
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
         raise JudgeOutputError(f"judge reply is not valid JSON: {error}") from error
 
     if not isinstance(payload, dict):
@@ -176,12 +177,22 @@ def _judge_callable():
     return judge
 
 
+def _invoke_judge(judge, prompt: str):
+    roles = split_prompt_roles(prompt)
+    request = (
+        [("system", roles[0]), ("human", roles[1])]
+        if roles is not None
+        else prompt
+    )
+    return judge.invoke(request)
+
+
 def judge_retrieval(query: str, retrieved_docs: Sequence[dict], judge) -> JudgeScores:
     """Ask the judge how relevant the retrieved docs are to ``query``."""
     prompt = load_prompt_for(PromptOperation.EVALUATION_RETRIEVAL).render(
         query=query, context=_render_context(retrieved_docs)
     )
-    response = judge.invoke(prompt)
+    response = _invoke_judge(judge, prompt)
     content = getattr(response, "content", response)
     text = content if isinstance(content, str) else str(content)
     return parse_judge_output(text).require("context_precision")
@@ -192,7 +203,7 @@ def judge_generation(query: str, answer: str, context: str, judge) -> JudgeScore
     prompt = load_prompt_for(PromptOperation.EVALUATION_GROUNDEDNESS).render(
         query=query, context=context, answer=answer
     )
-    response = judge.invoke(prompt)
+    response = _invoke_judge(judge, prompt)
     content = getattr(response, "content", response)
     text = content if isinstance(content, str) else str(content)
     return parse_judge_output(text).require("faithfulness", "answer_relevancy")

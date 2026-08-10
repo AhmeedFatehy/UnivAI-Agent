@@ -25,7 +25,7 @@ from agents.schemas import (
     SectionDraftLLM,
     SectionOutcome,
     SectionPackV1,
-    extract_json,
+    strict_json_document,
 )
 from planning.section_planner import (
     DEFAULT_SECTION_BUDGET,
@@ -193,8 +193,8 @@ def _generate_section_draft(
         last_raw = llm(current_prompt) or ""
         prompts.append(current_prompt)
         try:
-            payload = json.loads(extract_json(last_raw))
-        except (json.JSONDecodeError, TypeError) as error:
+            payload = json.loads(strict_json_document(last_raw))
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
             last_error = f"response is not valid JSON: {error}"
         else:
             try:

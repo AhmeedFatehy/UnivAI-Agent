@@ -4,6 +4,7 @@ Exposes RAG capabilities as tools for agents over HTTP.
 """
 import os
 import json
+import re
 import sys
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
@@ -12,7 +13,7 @@ CAMPUS_ROOT = Path(__file__).resolve().parent.parent
 if str(CAMPUS_ROOT) not in sys.path:
     sys.path.insert(0, str(CAMPUS_ROOT))
 
-from runtime import RuntimeMode, runtime_mode
+from runtime import REPOSITORY_ROOT, RuntimeMode, runtime_mode, standalone_root
 from retrieval.pipeline import retrieve_formatted
 from document_processing.loaders import load_document
 from document_processing.chunking import chunk_documents
@@ -48,6 +49,39 @@ def _screen_user_query(query: str) -> str | None:
         f"(matched: {', '.join(decision.matched_rules)}). The request is not "
         "allowed to override the assistant's instructions, tools or grounding."
     )
+
+
+_TENANT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_INGEST_EXTENSIONS = frozenset({".pdf", ".docx", ".txt", ".md", ".markdown"})
+
+
+def _approved_upload_path(file_path: str, user_id: str) -> Path:
+    """Resolve one upload under this learner's repository-owned directory.
+
+    MCP callers cannot use ingestion as an arbitrary local-file reader. Resolve
+    symlinks first, bind the path to the claimed tenant folder, and allow only
+    document formats supported by the upload UI.
+    """
+    tenant = (user_id or "").strip()
+    if not _TENANT_ID_RE.fullmatch(tenant):
+        raise ValueError("invalid tenant identifier")
+    candidate = Path(file_path).expanduser().resolve(strict=True)
+    if runtime_mode() is RuntimeMode.STANDALONE:
+        # Explicit non-production mode keeps its project fixtures and private
+        # standalone upload root; standalone_store applies the same check again.
+        allowed_roots = [
+            (REPOSITORY_ROOT / "fixtures").resolve(),
+            (standalone_root() / "uploads").resolve(),
+        ]
+        allowed_extensions = {".txt", ".md", ".markdown"}
+    else:
+        allowed_roots = [(CAMPUS_ROOT / "uploads" / tenant).resolve()]
+        allowed_extensions = _INGEST_EXTENSIONS
+    if not any(root == candidate or root in candidate.parents for root in allowed_roots):
+        raise ValueError("file is outside the learner upload directory")
+    if not candidate.is_file() or candidate.suffix.casefold() not in allowed_extensions:
+        raise ValueError("file is not an approved upload document")
+    return candidate
 
 
 @mcp.tool()
@@ -91,23 +125,24 @@ def retrieve_context(
 def _ingest_file_sync(file_path: str, user_id: str) -> str:
     """Blocking ingestion implementation, dispatched by the tenant coordinator."""
     try:
+        approved_path = _approved_upload_path(file_path, user_id)
         if runtime_mode() is RuntimeMode.STANDALONE:
             from standalone_store import ingest
 
-            result = ingest(file_path, user_id)
-            filename = os.path.basename(file_path)
+            result = ingest(str(approved_path), user_id)
+            filename = approved_path.name
             return (
                 f"Successfully ingested {filename}. Created "
                 f"{result['chunks_indexed']} chunks. Document ID: "
                 f"{result['document_id']}"
             )
         # 1. Load
-        docs = load_document(file_path)
+        docs = load_document(str(approved_path))
         if not docs:
             return "Failed to load document or document is empty."
             
         doc_type = docs[0].metadata.get("document_type", "unknown")
-        filename = os.path.basename(file_path)
+        filename = approved_path.name
         
         # 2. Chunk
         chunks = chunk_documents(docs, doc_type)
@@ -121,8 +156,8 @@ def _ingest_file_sync(file_path: str, user_id: str) -> str:
         )
         
         return f"Successfully ingested {filename}. Created {result['chunks_indexed']} chunks. Document ID: {result['document_id']}"
-    except Exception as e:
-        return f"Error during ingestion: {str(e)}"
+    except Exception:
+        return "Error during ingestion: the upload path or document is not allowed."
 
 
 @mcp.tool()
@@ -196,17 +231,18 @@ def _ingest_collection_sync(file_paths: list[str], collection_id: str, user_id: 
         user_id: The ID of the user/student who owns the collection.
     """
     try:
+        approved_paths = [str(_approved_upload_path(path, user_id)) for path in file_paths]
         report = call_tool(
             "ingest_collection",
             {
-                "paths": file_paths,
+                "paths": approved_paths,
                 "collection_id": collection_id,
                 "user_id": user_id,
             },
         )
         return report.model_dump_json(indent=2)
-    except Exception as e:
-        return f"Error during collection ingestion: {str(e)}"
+    except Exception:
+        return "Error during collection ingestion: an upload path or document is not allowed."
 
 
 @mcp.tool()
@@ -300,6 +336,7 @@ def _create_programme_plan_sync(
     try:
         from agents.graph import run_programme
         from agents.manager import AgentRuntime, ProgrammeRequest
+        from guardrails.prompt_boundary import split_prompt_roles
         from services.common.llm import TIMEOUT_GENERATION_S, complete
 
         # max_tokens is what marks this as a generation call, not a spoken
@@ -310,8 +347,15 @@ def _create_programme_plan_sync(
         # being silently cut. Eight topics with summaries, keywords and
         # citations need real room.
         def configured_llm(prompt: str) -> str:
+            roles = split_prompt_roles(prompt)
+            if roles is None:
+                raise ValueError("agent prompt is missing its trusted role boundary")
+            system, user_task = roles
             return complete(
-                prompt, max_tokens=PLANNING_MAX_TOKENS, timeout_s=TIMEOUT_GENERATION_S
+                user_task,
+                system=system,
+                max_tokens=PLANNING_MAX_TOKENS,
+                timeout_s=TIMEOUT_GENERATION_S,
             ).text
 
         result = run_programme(
@@ -328,8 +372,11 @@ def _create_programme_plan_sync(
             AgentRuntime(llm=configured_llm, max_steps=1),
         )
         return result.model_dump_json(indent=2)
-    except Exception as e:
-        return f"Error during programme planning: {str(e)}"
+    except Exception:
+        return (
+            "Error during programme planning: generation failed safely. "
+            "Retry the request or ask an administrator to inspect the server logs."
+        )
 
 
 @mcp.tool()

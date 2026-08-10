@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from document_processing.metadata import SourceLocation
 from planning.semester_planner import ChapterInventory, SemesterWeekPlan, plan_semester
@@ -41,12 +41,16 @@ class ApprovedBook(BaseModel):
 
 
 class EvidenceExcerpt(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     quote: str = Field(min_length=1)
     citation: SourceLocation
 
 
 class PrerequisiteProposal(BaseModel):
     """Untrusted model proposal, kept distinct from the validated edge."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     prerequisite_book_id: str = Field(min_length=1)
     dependent_book_id: str = Field(min_length=1)
@@ -64,6 +68,8 @@ class PrerequisiteEdge(PrerequisiteProposal):
 
 class PrerequisiteAnalysisDraft(BaseModel):
     """Named schema for the complete AI-produced proposal batch."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     proposals: list[PrerequisiteProposal] = Field(default_factory=list)
 

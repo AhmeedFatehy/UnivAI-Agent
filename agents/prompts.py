@@ -5,10 +5,18 @@ from __future__ import annotations
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from guardrails.prompt_boundary import (
+    enforce_prompt_size,
+    quote_untrusted_data,
+    render_system_instructions,
+    render_user_task,
+)
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
@@ -22,6 +30,7 @@ class PromptId(str, Enum):
     LEARNING_PATH_GENERATION = "curriculum/learning_path_generation"
     LEARNING_PATH_REPAIR = "curriculum/learning_path_repair"
     LECTURE_GENERATION = "teaching/lecture_generation"
+    SLIDE_BATCH_GENERATION = "teaching/slide_batch_generation"
     LECTURE_SUMMARY = "teaching/lecture_summary"
     LEARNING_OBJECTIVES = "teaching/learning_objectives"
     SECTION_GENERATION = "teaching/section_generation"
@@ -29,6 +38,7 @@ class PromptId(str, Enum):
     DIAGNOSTIC = "assessment/diagnostic"
     PRACTICE = "assessment/practice"
     QUIZ = "assessment/quiz"
+    QUIZ_BANK_GENERATION = "assessment/quiz_bank_generation"
     ASSIGNMENT = "assessment/assignment"
     MIDTERM = "assessment/midterm"
     FINAL = "assessment/final"
@@ -54,6 +64,7 @@ class PromptOperation(str, Enum):
     CURRICULUM_GENERATE_LEARNING_PATH = "curriculum.generate_learning_path"
     CURRICULUM_REPAIR_LEARNING_PATH = "curriculum.repair_learning_path"
     CONTENT_GENERATE_LECTURE = "content.generate_lecture"
+    CONTENT_GENERATE_SLIDE_BATCH = "content.generate_slide_batch"
     CONTENT_SUMMARIZE_LECTURE = "content.summarize_lecture"
     CONTENT_GENERATE_OBJECTIVES = "content.generate_learning_objectives"
     CONTENT_GENERATE_SECTION = "content.generate_section"
@@ -61,6 +72,7 @@ class PromptOperation(str, Enum):
     ASSESSMENT_DIAGNOSTIC = "assessment.generate:diagnostic"
     ASSESSMENT_PRACTICE = "assessment.generate:practice"
     ASSESSMENT_QUIZ = "assessment.generate:quiz"
+    ASSESSMENT_QUIZ_BANK = "assessment.generate:quiz_bank"
     ASSESSMENT_ASSIGNMENT = "assessment.generate:assignment"
     ASSESSMENT_MIDTERM = "assessment.generate:midterm"
     ASSESSMENT_FINAL = "assessment.generate:final"
@@ -80,12 +92,18 @@ class PromptOperation(str, Enum):
 class PromptTemplate(BaseModel):
     """One authored prompt plus the metadata required to route it safely."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: PromptId
     version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
     description: str = Field(min_length=1)
     owner: str = Field(min_length=1)
     operations: list[PromptOperation] = Field(min_length=1)
     variables: list[str] = Field(default_factory=list)
+    # Secure default: every dynamic value is quoted data. Only deterministic
+    # application controls (counts, internal schemas, enum-derived formats) may
+    # be declared trusted by the authored template.
+    trusted_variables: list[str] = Field(default_factory=list)
     output_schema: str = Field(min_length=1)
     grounding_policy: str = Field(min_length=1)
     capabilities: list[str] = Field(default_factory=list)
@@ -93,6 +111,30 @@ class PromptTemplate(BaseModel):
     safety: list[str] = Field(default_factory=list)
     system: str = Field(min_length=1)
     user: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_variable_boundary(self) -> "PromptTemplate":
+        if len(set(self.variables)) != len(self.variables):
+            raise ValueError("prompt variables must be unique")
+        if len(set(self.trusted_variables)) != len(self.trusted_variables):
+            raise ValueError("trusted prompt variables must be unique")
+        unknown_trusted = set(self.trusted_variables) - set(self.variables)
+        if unknown_trusted:
+            raise ValueError(
+                f"trusted variables are not declared prompt variables: {sorted(unknown_trusted)}"
+            )
+        system_placeholders = [
+            name for name in self.variables if "{" + name + "}" in self.system
+        ]
+        if system_placeholders:
+            raise ValueError(
+                "dynamic values cannot be interpolated into system instructions: "
+                f"{system_placeholders}"
+            )
+        unused = [name for name in self.variables if "{" + name + "}" not in self.user]
+        if unused:
+            raise ValueError(f"declared prompt variables are unused: {unused}")
+        return self
 
     def render_user(self, **values: Any) -> str:
         missing = [name for name in self.variables if name not in values]
@@ -102,24 +144,46 @@ class PromptTemplate(BaseModel):
                 "which were not supplied"
             )
 
-        body = self.user
-        for name in self.variables:
-            body = body.replace("{" + name + "}", str(values[name]))
-
-        leftover = [
-            name for name in self.variables if "{" + name + "}" in body
-        ]
-        if leftover:
-            raise ValueError(
-                f"prompt '{self.name.value}' still contains {leftover} after render"
+        extras = sorted(set(values) - set(self.variables))
+        if extras:
+            raise KeyError(
+                f"prompt '{self.name.value}' received undeclared values: {extras}"
             )
-        return body.strip()
+
+        rendered_values: dict[str, str] = {}
+        for name in self.variables:
+            rendered_values[name] = (
+                str(values[name])
+                if name in self.trusted_variables
+                else quote_untrusted_data(values[name], label=name)
+            )
+        # One substitution pass is essential. Sequential ``str.replace`` lets
+        # one untrusted value inject ``{another_variable}`` and have a later
+        # iteration reinterpret it as template syntax.
+        variable_pattern = re.compile(
+            r"\{(" + "|".join(re.escape(name) for name in self.variables) + r")\}"
+        ) if self.variables else None
+        body = (
+            variable_pattern.sub(lambda match: rendered_values[match.group(1)], self.user)
+            if variable_pattern is not None
+            else self.user
+        )
+
+        return render_user_task(body)
+
+    def render_system(self) -> str:
+        """Return repository-owned instructions with the mandatory boundary policy."""
+        return render_system_instructions(self.system)
 
     def render(self, **values: Any) -> str:
-        return f"{self.system.strip()}\n\n{self.render_user(**values)}"
+        return enforce_prompt_size(
+            f"{self.render_system()}\n\n{self.render_user(**values)}"
+        )
 
 
 class PromptRegistry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     schema_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
     routes: dict[PromptOperation, PromptId]
     aliases: dict[str, PromptId] = Field(default_factory=dict)

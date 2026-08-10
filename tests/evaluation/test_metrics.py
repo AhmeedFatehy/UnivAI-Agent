@@ -142,8 +142,10 @@ def test_judge_generation_validates_and_uses_the_registry_prompt():
 
     assert scores.faithfulness == pytest.approx(0.9)
     assert scores.answer_relevancy == pytest.approx(0.85)
-    assert "Query: q" in judge.prompts[0]
-    assert "Answer:" in judge.prompts[0]
+    rendered = str(judge.prompts[0])
+    assert "PROMPT BOUNDARY POLICY" in rendered
+    assert 'name="query"' in rendered and "q" in rendered
+    assert 'name="answer"' in rendered and "answer" in rendered
 
 
 def test_judge_retrieval_uses_the_retrieval_prompt():
@@ -151,7 +153,9 @@ def test_judge_retrieval_uses_the_retrieval_prompt():
     scores = judge_retrieval("q", [{"content": "some passage"}], judge)
 
     assert scores.context_precision == pytest.approx(0.6)
-    assert "[Doc 1] some passage" in judge.prompts[0]
+    rendered = str(judge.prompts[0])
+    assert "PROMPT BOUNDARY POLICY" in rendered
+    assert "[Doc 1] some passage" in rendered
 
 
 def test_a_malformed_judge_reply_fails_the_generation_evaluation():

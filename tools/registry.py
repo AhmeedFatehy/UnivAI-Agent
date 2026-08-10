@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cache.authorization import GrantDenied, GrantStore
 from document_processing.batch_ingestion import (
@@ -35,6 +35,8 @@ from document_processing.batch_ingestion import (
 )
 from document_processing.batch_ingestion import ingest_collection as _run_ingest_collection
 from document_processing.metadata import SourceLocation, citation_from_payload
+from guardrails.input import classify_source_text
+from guardrails.prompt_boundary import quote_untrusted_data
 from planning.overlap import Topic, content_terms
 from planning.programme_planner import ProgrammePlan, create_programme_plan
 from planning.workload import DEFAULT_SEMESTER_CAPACITY_HOURS
@@ -98,6 +100,8 @@ class GroundedPassage(BaseModel):
     score: float
     term_coverage: float = Field(ge=0.0, le=1.0)
     citation: SourceLocation
+    source_injection_flagged: bool = False
+    source_injection_rules: list[str] = Field(default_factory=list)
 
 
 class Refusal(BaseModel):
@@ -153,7 +157,8 @@ class GroundedContext(BaseModel):
             if len(body) > max_chars:
                 body = body[:max_chars].rstrip() + "…"
             blocks.append(
-                f"[{passage.passage_id}] {passage.citation.label()}\n{body}"
+                f"[{passage.passage_id}] {passage.citation.label()}\n"
+                + quote_untrusted_data(body, label=f"passage-{passage.passage_id}")
             )
         return "\n\n".join(blocks)
 
@@ -170,6 +175,8 @@ def term_coverage(query: str, passage: str) -> float:
 
 
 class IngestCollectionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     paths: list[str] = Field(min_length=1)
     collection_id: str = Field(min_length=1)
     user_id: str = Field(min_length=1)
@@ -178,7 +185,9 @@ class IngestCollectionInput(BaseModel):
 
 
 class RetrieveContextInput(BaseModel):
-    query: str = Field(min_length=1)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    query: str = Field(min_length=1, max_length=4_000)
     user_id: str = Field(min_length=1)
     collection_id: str | None = None
     document_ids: list[str] = Field(default_factory=list)
@@ -191,6 +200,8 @@ class RetrieveContextInput(BaseModel):
 
 
 class CreateProgrammePlanInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     topics: list[Topic] = Field(min_length=1)
     programme_title: str = Field(min_length=1)
     collection_id: str = Field(min_length=1)
@@ -199,6 +210,8 @@ class CreateProgrammePlanInput(BaseModel):
 
 
 class GetSourceLocationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     user_id: str = Field(min_length=1)
     document_id: str = Field(min_length=1)
     chunk_index: int | None = Field(default=None, ge=0)
@@ -368,14 +381,20 @@ def retrieve_context_tool(
 
     passages: list[GroundedPassage] = []
     uncitable = 0
-    unsafe = 0
     for hit in hits:
-        if hit.get("source_injection_flagged") is True:
-            unsafe += 1
-            continue
         content = (hit.get("content") or "").strip()
         if not content:
             continue
+        # Screen again at the typed tool boundary; never trust a metadata flag
+        # produced upstream. The verdict remains risk metadata rather than a
+        # topical content ban, so security textbooks can still be taught from
+        # inside the non-breakable untrusted-data prompt boundary.
+        source_decision = classify_source_text(content)
+        flagged = bool(hit.get("source_injection_flagged")) or not source_decision.safe
+        rules = list(source_decision.matched_rules)
+        for rule in hit.get("source_injection_rules") or []:
+            if isinstance(rule, str) and rule not in rules:
+                rules.append(rule)
         citation = citation_from_payload(hit)
         if citation is None:
             uncitable += 1
@@ -394,15 +413,15 @@ def retrieve_context_tool(
                 score=score,
                 term_coverage=round(coverage, 4),
                 citation=citation,
+                source_injection_flagged=flagged,
+                source_injection_rules=rules,
             )
         )
         if len(passages) >= payload.limit:
             break
 
     if not passages:
-        if unsafe == len(hits):
-            reason = REFUSAL_UNSAFE_SOURCE
-        elif uncitable + unsafe == len(hits) and uncitable:
+        if uncitable == len(hits):
             reason = REFUSAL_UNCITABLE
         else:
             reason = REFUSAL_NO_GROUNDING

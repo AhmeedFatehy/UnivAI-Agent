@@ -14,7 +14,7 @@ from enum import Enum
 from math import ceil
 from typing import Iterable
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SEMESTER_PLAN_SCHEMA = "univai.semester.week-plan"
 SEMESTER_PLAN_VERSION = "2.0.0"
@@ -266,6 +266,8 @@ class SemesterWeekPlan(BaseModel):
 
 
 class ChapterDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     chapter_id: str = Field(min_length=1)
     title: str = Field(min_length=1)
     start_page: int = Field(ge=1)
@@ -274,6 +276,8 @@ class ChapterDraft(BaseModel):
 
 
 class BookStructureDraftLLM(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     book_title: str = Field(min_length=1)
     chapters: list[ChapterDraft] = Field(min_length=1)
     confidence: float = Field(default=1.0, ge=0, le=1)
@@ -281,6 +285,8 @@ class BookStructureDraftLLM(BaseModel):
 
 
 class WeekDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     chapter_ids: list[str] = Field(min_length=1, max_length=3)
     split_chapter_id: str | None = None
     split_part: int | None = Field(default=None, ge=1, le=2)
@@ -289,6 +295,8 @@ class WeekDraft(BaseModel):
 
 
 class SemesterPlanDraftLLM(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     weeks: list[WeekDraft] = Field(min_length=1)
 
 

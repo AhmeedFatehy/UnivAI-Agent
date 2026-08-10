@@ -143,9 +143,12 @@ def _prompt_versions() -> dict[str, str]:
     """Every routed prompt id mapped to its semantic version."""
     try:
         from agents.prompts import validate_prompt_catalog
+        from guardrails.prompt_boundary import PROMPT_BOUNDARY_POLICY_VERSION
 
         catalog = validate_prompt_catalog()
-        return {prompt.name.value: prompt.version for prompt in catalog.values()}
+        versions = {prompt.name.value: prompt.version for prompt in catalog.values()}
+        versions["platform/prompt_boundary"] = PROMPT_BOUNDARY_POLICY_VERSION
+        return versions
     except Exception:  # noqa: BLE001 - a broken catalog must not crash fingerprinting
         return {}
 

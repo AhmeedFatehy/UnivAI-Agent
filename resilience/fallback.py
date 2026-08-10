@@ -239,11 +239,18 @@ def _ollama_backend(
     """Backend over ``langchain_ollama`` reading real token metadata when offered."""
 
     from langchain_ollama import ChatOllama
+    from guardrails.prompt_boundary import split_prompt_roles
 
     client = ChatOllama(model=spec.model, base_url=base_url, temperature=temperature)
 
     def complete(prompt: str) -> ServedResult:
-        response = client.invoke(prompt)
+        roles = split_prompt_roles(prompt)
+        request = (
+            [("system", roles[0]), ("human", roles[1])]
+            if roles is not None
+            else prompt
+        )
+        response = client.invoke(request)
         content = getattr(response, "content", response)
         text = content if isinstance(content, str) else str(content)
 

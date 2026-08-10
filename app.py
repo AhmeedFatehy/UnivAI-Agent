@@ -50,9 +50,6 @@ for msg in st.session_state.messages:
 user_input = st.chat_input("Ask a question about your uploaded materials...")
 
 if user_input:
-    # Add context about who the user is to the prompt
-    contextualized_input = f"[My User ID is '{user_id}'].\nUser Question: {user_input}"
-    
     # Store and display user message
     st.session_state.messages.append({"role": "user", "content": user_input})
     st.chat_message("user").write(user_input)
@@ -66,7 +63,8 @@ if user_input:
             try:
                 # Stream response while managing MCP client lifecycle internally
                 async for token in run_agent_stream(
-                    contextualized_input,
+                    user_input,
+                    user_id=user_id,
                     thread_id=st.session_state.session_id
                 ):
                     full_response += token

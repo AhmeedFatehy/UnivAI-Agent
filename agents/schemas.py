@@ -22,7 +22,14 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, TypeVar
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from agents.prompts import PromptOperation, PromptTemplate, load_prompt, load_prompt_for
 from document_processing.metadata import SourceLocation
@@ -52,6 +59,7 @@ SECTION_SCHEMA_VERSION = "1.0.0"
 DEFAULT_REPAIR_ATTEMPTS = 1
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+_FULL_FENCE_RE = re.compile(r"\A```(?:json)?\s*(.*?)\s*```\Z", re.DOTALL)
 _PASSAGE_ID_RE = re.compile(r"^S\d+$")
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -221,15 +229,21 @@ def clean_passage_ids(values: list[str]) -> list[str]:
     return list(dict.fromkeys(cleaned))
 
 
-class ExtractedTopic(BaseModel):
+class StrictLLMOutput(BaseModel):
+    """Fail-closed base for data crossing from a model into application code."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class ExtractedTopic(StrictLLMOutput):
     """A topic proposed by the model, citing passage ids it was shown."""
 
-    title: str = Field(min_length=1)
-    summary: str = Field(min_length=1)
-    keywords: list[str] = Field(default_factory=list)
-    prerequisites: list[str] = Field(default_factory=list)
+    title: str = Field(min_length=1, max_length=300)
+    summary: str = Field(min_length=1, max_length=4_000)
+    keywords: list[str] = Field(default_factory=list, max_length=30)
+    prerequisites: list[str] = Field(default_factory=list, max_length=30)
     difficulty: int = Field(default=3, ge=1, le=5)
-    source_ids: list[str] = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1, max_length=50)
 
     @field_validator("source_ids")
     @classmethod
@@ -237,17 +251,17 @@ class ExtractedTopic(BaseModel):
         return clean_passage_ids(values)
 
 
-class TopicExtraction(BaseModel):
-    topics: list[ExtractedTopic] = Field(min_length=1)
+class TopicExtraction(StrictLLMOutput):
+    topics: list[ExtractedTopic] = Field(min_length=1, max_length=100)
 
 
-class DraftSegment(BaseModel):
+class DraftSegment(StrictLLMOutput):
     """One slide's narration, with the passage ids it is built from."""
 
     slide: int = Field(ge=1)
-    heading: str = Field(min_length=1)
-    text: str = Field(min_length=1)
-    source_ids: list[str] = Field(min_length=1)
+    heading: str = Field(min_length=1, max_length=300)
+    text: str = Field(min_length=1, max_length=10_000)
+    source_ids: list[str] = Field(min_length=1, max_length=50)
 
     @field_validator("source_ids")
     @classmethod
@@ -255,21 +269,21 @@ class DraftSegment(BaseModel):
         return clean_passage_ids(values)
 
 
-class LectureDraftLLM(BaseModel):
-    title: str = Field(min_length=1)
-    segments: list[DraftSegment] = Field(min_length=1)
+class LectureDraftLLM(StrictLLMOutput):
+    title: str = Field(min_length=1, max_length=300)
+    segments: list[DraftSegment] = Field(min_length=1, max_length=200)
 
 
-class DraftQuestion(BaseModel):
-    prompt: str = Field(min_length=1)
+class DraftQuestion(StrictLLMOutput):
+    prompt: str = Field(min_length=1, max_length=2_000)
     options: list[str] = Field(min_length=4, max_length=6)
     correct_option: Literal["A", "B", "C", "D", "E", "F"]
     source: Literal["lecture", "self_study"] = "lecture"
-    source_ids: list[str] = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1, max_length=50)
     difficulty: int = Field(default=2, ge=1, le=5)
-    learning_objectives: list[str] = Field(default_factory=list)
-    rubric: list[str] = Field(default_factory=list)
-    follow_up_prompts: list[str] = Field(default_factory=list)
+    learning_objectives: list[str] = Field(default_factory=list, max_length=30)
+    rubric: list[str] = Field(default_factory=list, max_length=30)
+    follow_up_prompts: list[str] = Field(default_factory=list, max_length=30)
 
     @field_validator("source_ids")
     @classmethod
@@ -287,9 +301,9 @@ class DraftQuestion(BaseModel):
         return cleaned
 
 
-class AssessmentDraftLLM(BaseModel):
+class AssessmentDraftLLM(StrictLLMOutput):
     assessment_type: AssessmentType = AssessmentType.QUIZ
-    questions: list[DraftQuestion] = Field(min_length=1)
+    questions: list[DraftQuestion] = Field(min_length=1, max_length=200)
 
     @model_validator(mode="after")
     def _assessment_option_contract(self):
@@ -311,9 +325,9 @@ class AssessmentDraftLLM(BaseModel):
         return self
 
 
-class AnswerExplanationLLM(BaseModel):
-    explanation: str = Field(min_length=1)
-    source_ids: list[str] = Field(min_length=1)
+class AnswerExplanationLLM(StrictLLMOutput):
+    explanation: str = Field(min_length=1, max_length=10_000)
+    source_ids: list[str] = Field(min_length=1, max_length=50)
 
     @field_validator("source_ids")
     @classmethod
@@ -321,7 +335,7 @@ class AnswerExplanationLLM(BaseModel):
         return clean_passage_ids(values)
 
 
-class SectionActivityDraftLLM(BaseModel):
+class SectionActivityDraftLLM(StrictLLMOutput):
     """One guided-practice activity the model proposes for the section."""
 
     title: str = Field(min_length=1)
@@ -335,7 +349,7 @@ class SectionActivityDraftLLM(BaseModel):
         return clean_passage_ids(values)
 
 
-class SectionStepDraftLLM(BaseModel):
+class SectionStepDraftLLM(StrictLLMOutput):
     """One step of a worked example, each step citing its evidence."""
 
     step: str = Field(min_length=1)
@@ -348,7 +362,7 @@ class SectionStepDraftLLM(BaseModel):
         return clean_passage_ids(values)
 
 
-class SectionExampleDraftLLM(BaseModel):
+class SectionExampleDraftLLM(StrictLLMOutput):
     """A worked example: a problem solved step by step against the evidence."""
 
     order: int = Field(ge=1)
@@ -363,7 +377,7 @@ class SectionExampleDraftLLM(BaseModel):
         return clean_passage_ids(values)
 
 
-class SectionTodoDraftLLM(BaseModel):
+class SectionTodoDraftLLM(StrictLLMOutput):
     """An actionable learner TODO. Empty lists mean evidence could not support one."""
 
     text: str = Field(min_length=1)
@@ -376,7 +390,7 @@ class SectionTodoDraftLLM(BaseModel):
         return clean_passage_ids(values)
 
 
-class SectionDraftLLM(BaseModel):
+class SectionDraftLLM(StrictLLMOutput):
     """The unvalidated section pack as the model returns it.
 
     ``examples`` and ``todos`` may be empty: the planner treats an empty list as
@@ -676,6 +690,26 @@ def extract_json(raw: str) -> str:
     return text[start:]
 
 
+def strict_json_document(raw: str) -> str:
+    """Return an exact JSON document, allowing only one enclosing code fence.
+
+    Arbitrary preambles or trailing model text are rejected instead of being
+    silently discarded. This prevents a valid object from smuggling an
+    instruction or second payload alongside the data the application validates.
+    """
+    text = (raw or "").strip()
+    fenced = _FULL_FENCE_RE.fullmatch(text)
+    if fenced:
+        text = fenced.group(1).strip()
+    if not text or text[0] not in "[{" or text[-1] not in "]}":
+        raise ValueError("reply must contain exactly one JSON document")
+    try:
+        json.loads(text)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ValueError(f"reply must contain exactly one valid JSON document: {error}") from error
+    return text
+
+
 def generate_structured(
     llm: Callable[[str], str],
     prompt: str,
@@ -709,8 +743,8 @@ def generate_structured(
         last_raw = llm(current_prompt) or ""
         _record_serving(llm, on_served)
         try:
-            payload = json.loads(extract_json(last_raw))
-        except (json.JSONDecodeError, TypeError) as error:
+            payload = json.loads(strict_json_document(last_raw))
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
             last_error = f"response is not valid JSON: {error}"
         else:
             try:
@@ -888,5 +922,6 @@ __all__ = [
     "generate_structured",
     "load_prompt",
     "resolve_citations",
+    "strict_json_document",
     "topics_from_extraction",
 ]

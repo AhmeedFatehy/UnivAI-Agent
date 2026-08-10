@@ -243,6 +243,7 @@ def ollama_llm(model: str | None = None, base_url: str | None = None) -> Callabl
     from langchain_ollama import ChatOllama
 
     from config import LLM_BASE_URL, LLM_MODEL
+    from guardrails.prompt_boundary import split_prompt_roles
 
     client = ChatOllama(
         model=model or LLM_MODEL,
@@ -251,7 +252,13 @@ def ollama_llm(model: str | None = None, base_url: str | None = None) -> Callabl
     )
 
     def call(prompt: str) -> str:
-        response = client.invoke(prompt)
+        roles = split_prompt_roles(prompt)
+        request = (
+            [("system", roles[0]), ("human", roles[1])]
+            if roles is not None
+            else prompt
+        )
+        response = client.invoke(request)
         content = getattr(response, "content", response)
         return content if isinstance(content, str) else str(content)
 

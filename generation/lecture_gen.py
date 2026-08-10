@@ -37,6 +37,12 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from agents.prompts import PromptOperation, load_prompt_for
+from agents.schemas import strict_json_document
+from guardrails.prompt_boundary import (
+    PROMPT_BOUNDARY_POLICY_VERSION,
+    quote_untrusted_data,
+    split_prompt_roles,
+)
 from planning.semester_planner import (
     MAX_CHAPTERS_PER_SEMESTER,
     MAX_CHAPTERS_PER_WEEK,
@@ -172,9 +178,11 @@ REPAIR_REPLY_CHARS = 16000
 
 _LECTURE_PROMPT = load_prompt_for(PromptOperation.CONTENT_GENERATE_LECTURE)
 _QUIZ_PROMPT = load_prompt_for(PromptOperation.ASSESSMENT_QUIZ)
+_SLIDE_BATCH_PROMPT = load_prompt_for(PromptOperation.CONTENT_GENERATE_SLIDE_BATCH)
+_QUIZ_BANK_PROMPT = load_prompt_for(PromptOperation.ASSESSMENT_QUIZ_BANK)
 _SECTION_PROMPT = load_prompt_for(PromptOperation.CONTENT_GENERATE_SECTION)
-LECTURE_SYSTEM = _LECTURE_PROMPT.system
-QUIZ_SYSTEM = _QUIZ_PROMPT.system
+LECTURE_SYSTEM = _SLIDE_BATCH_PROMPT.render_system()
+QUIZ_SYSTEM = _QUIZ_BANK_PROMPT.render_system()
 
 
 def course_components() -> CourseComponents:
@@ -194,7 +202,10 @@ def course_components() -> CourseComponents:
         min_lecture_questions=MIN_LECTURE_QUESTIONS,
         prompt_versions=(
             f"lecture={_LECTURE_PROMPT.version},quiz={_QUIZ_PROMPT.version},"
-            f"section={_SECTION_PROMPT.version}"
+            f"slide_batch={_SLIDE_BATCH_PROMPT.version},"
+            f"quiz_bank={_QUIZ_BANK_PROMPT.version},"
+            f"section={_SECTION_PROMPT.version},"
+            f"boundary={PROMPT_BOUNDARY_POLICY_VERSION}"
         ),
         # Whichever model actually writes the course. A course written by a
         # weaker model must never be reused for a run configured with a
@@ -418,7 +429,10 @@ def source_block(pages: list[tuple[int, str]]) -> str:
         chunk = text[: min(MAX_CHARS_PER_PAGE, budget)]
         if not chunk:
             break
-        parts.append(f"[page {number}]\n{chunk}")
+        parts.append(
+            f"[page {number}]\n"
+            + quote_untrusted_data(chunk, label=f"textbook-page-{number}")
+        )
         budget -= len(chunk)
     return "\n\n".join(parts)
 
@@ -427,25 +441,12 @@ def source_block(pages: list[tuple[int, str]]) -> str:
 
 
 def parse_json(raw: str) -> dict | None:
-    """Small models wrap JSON in fences or chatter; dig the object out."""
-    text = raw.strip()
-    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1)
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
+    """Parse exactly one JSON object; malformed output goes through repair."""
+    try:
+        payload = json.loads(strict_json_document(raw))
+    except (json.JSONDecodeError, TypeError, ValueError):
         return None
-    text = text[start : end + 1]
-    # The classic small-model sins, repaired before giving up: smart quotes
-    # around/inside strings and trailing commas before a closing bracket.
-    for candidate in (text, re.sub(r",\s*([}\]])", r"\1", text.replace("“", '"').replace("”", '"'))):
-        try:
-            # strict=False: literal newlines/tabs inside strings are the other
-            # classic small-model sin, and they carry no ambiguity for us.
-            return json.loads(candidate, strict=False)
-        except json.JSONDecodeError:
-            continue
-    return None
+    return payload if isinstance(payload, dict) else None
 
 
 def ask_json(prompt: str, system: str, max_tokens: int, check) -> dict:
@@ -457,17 +458,18 @@ def ask_json(prompt: str, system: str, max_tokens: int, check) -> dict:
     repair_template = load_prompt_for(PromptOperation.SHARED_REPAIR_JSON)
     last = "no attempts made"
     current_prompt = prompt
+    current_system = system
     for attempt in range(1, ATTEMPTS + 1):
         force = fallback if (attempt == ATTEMPTS and fallback) else generation_model
         try:
             result = complete(
                 current_prompt,
-                system,
+                current_system,
                 max_tokens=max_tokens,
                 force_spec=force,
             )
         except LLMError as exc:
-            last = str(exc)
+            last = f"provider failure ({type(exc).__name__})"
             continue
         data = parse_json(result.text)
         problem = check(data) if data is not None else "reply was not JSON"
@@ -475,14 +477,16 @@ def ask_json(prompt: str, system: str, max_tokens: int, check) -> dict:
             return data
         last = f"attempt {attempt}: {problem}"
         print(f"[lecture-gen] retrying - {last}", flush=True)
-        print(f"[lecture-gen]   reply began: {result.text[:200]!r}", flush=True)
-        print(f"[lecture-gen]   reply ended: {result.text[-200:]!r}", flush=True)
-        current_prompt = repair_template.render(
+        # Never copy provider output into logs: rejected text can contain source
+        # content, prompt fragments, or provider diagnostics. The next attempt
+        # gets it only inside the shared untrusted-data boundary.
+        current_prompt = repair_template.render_user(
             original_prompt=prompt,
             previous_reply=result.text[:REPAIR_REPLY_CHARS],
             validation_errors=problem,
             json_schema="Use the exact JSON shape and rules in the original prompt.",
         )
+        current_system = repair_template.render_system()
     raise RuntimeError(f"model never produced valid JSON ({last})")
 
 
@@ -493,8 +497,21 @@ def check_lecture(
     data: dict, expected_slides: int | None = None, require_intro: bool = True
 ) -> str | None:
     expected = lecture_shape(0)["slides"] if expected_slides is None else expected_slides
-    if not isinstance(data.get("title"), str) or not data["title"].strip():
+    if not isinstance(data, dict):
+        return "reply must be one JSON object"
+    unknown_top = set(data) - {"title", "intro", "slides"}
+    if unknown_top:
+        return f"unknown top-level fields: {sorted(unknown_top)}"
+    if (
+        not isinstance(data.get("title"), str)
+        or not data["title"].strip()
+        or len(data["title"]) > 200
+    ):
         return "missing title"
+    if "intro" in data and (
+        not isinstance(data["intro"], str) or len(data["intro"]) > 2_000
+    ):
+        return "intro must be a string under 2000 characters"
     slides = data.get("slides")
     # A couple of slides short is a trim problem, not a rejection: demanding
     # exactly N well-formed slides from a small model kills whole builds over
@@ -502,14 +519,24 @@ def check_lecture(
     minimum = max(1, expected - 2)
     if not isinstance(slides, list) or len(slides) < minimum:
         return f"need at least {minimum} slides"
+    if len(slides) > expected:
+        return f"need no more than {expected} slides"
     # Name the offending slide. This string is handed straight back to the model
     # as the repair instruction (ask_json -> validation_errors), and a batch is
     # rejected whole even when a single slide is short, so "each slide needs..."
     # told it nothing about WHICH slide to fix — every retry reproduced the same
     # fault and the week died after ATTEMPTS identical rejections.
     for position, slide in enumerate(slides[:expected], start=1):
+        if not isinstance(slide, dict):
+            return f"slide {position} must be one JSON object"
+        unknown_slide = set(slide) - {
+            "heading", "layout", "bullets", "callout", "emphasis", "visual",
+            "narration", "page",
+        }
+        if unknown_slide:
+            return f"slide {position} has unknown fields: {sorted(unknown_slide)}"
         heading = slide.get("heading")
-        if not isinstance(heading, str) or not heading.strip():
+        if not isinstance(heading, str) or not heading.strip() or len(heading) > 200:
             return f"slide {position} is missing its heading"
         where = f"slide {position} ({heading.strip()!r})"
         bullets = slide.get("bullets")
@@ -517,6 +544,13 @@ def check_lecture(
             isinstance(b, str) and b.strip() for b in bullets
         ):
             return f"{where} needs at least one bullet"
+        if len(bullets) > 8 or any(
+            not isinstance(bullet, str) or len(bullet) > 500 for bullet in bullets
+        ):
+            return f"{where} has invalid or oversized bullets"
+        normalised_bullets = [bullet.strip().casefold() for bullet in bullets]
+        if len(normalised_bullets) != len(set(normalised_bullets)):
+            return f"{where} has duplicate bullets"
         narration = slide.get("narration")
         spoken = len(narration.split()) if isinstance(narration, str) else 0
         if spoken < 15:
@@ -524,6 +558,8 @@ def check_lecture(
                 f"{where} has {spoken}-word narration; rewrite only that slide's "
                 "narration so it is at least 15 spoken words. Leave the others as they are."
             )
+        if len(narration) > 5_000 or spoken > 750:
+            return f"{where} narration exceeds the safe output limit"
         if not isinstance(slide.get("page"), int) or isinstance(slide.get("page"), bool):
             return f"{where} needs the page number it came from"
     # Only the opening batch introduces the lecture; the ones that continue it
@@ -623,28 +659,19 @@ def _generate_batch(
         "part " + str(batch - 1) + " stopped, do not re-introduce the lecture or repeat "
         "material already covered.\n"
     )
-    prompt = (
-        f"These are pages {valid_pages[0]}-{valid_pages[-1]} of a textbook. "
-        f"Create lecture {week} of a {total_weeks}-week course from them. "
-        f"This week covers: {assigned_chapters}.\n"
-        + continues
-        + "\n"
-        "Return exactly this JSON shape:\n"
-        "{\n"
-        '  "title": "short lecture title",\n'
-        + intro_line
-        + '  "slides": [\n'
-        '    {"heading": "...", "layout": "concept", "bullets": ["...", "..."], '
-        '"callout": "", "emphasis": [], "visual": {}, '
-        f'"narration": "{narration} spoken sentences explaining this slide", "page": <page number the content came from>}}\n'
-        "  ]\n"
-        "}\n\n"
-        + SLIDE_DESIGN_INSTRUCTIONS
-        + "\n"
-        f"Rules: exactly {slides} slides. Bullets are short phrases. "
-        "Narration is natural speech - no bullet symbols, no 'as you can see'. "
-        f'"page" must be one of {valid_pages}.\n\n'
-        "Textbook pages:\n" + source_block(pages)
+    prompt = _SLIDE_BATCH_PROMPT.render_user(
+        week=week,
+        total_weeks=total_weeks,
+        page_start=valid_pages[0],
+        page_end=valid_pages[-1],
+        assigned_chapters=assigned_chapters,
+        continuation=continues or "Start the lecture; do not assume prior narration.",
+        slide_count=slides,
+        narration_range=narration,
+        intro_field=intro_line.rstrip(),
+        valid_pages=valid_pages,
+        slide_design=SLIDE_DESIGN_INSTRUCTIONS,
+        evidence=source_block(pages),
     )
     # Give the reply room to finish: a verbose narrator ran an M-size reply out
     # of tokens at 260/slide. Only ever one batch's worth, never the lecture's.
@@ -671,19 +698,43 @@ def _generate_batch(
     return data
 
 
-def check_quiz(minimum: int):
+def check_quiz(minimum: int, maximum: int | None = None):
     def check(data: dict) -> str | None:
+        if not isinstance(data, dict):
+            return "reply must be one JSON object"
+        unknown_top = set(data) - {"questions"}
+        if unknown_top:
+            return f"unknown top-level fields: {sorted(unknown_top)}"
         questions = data.get("questions")
         if not isinstance(questions, list) or len(questions) < minimum:
             return f"need at least {minimum} questions"
-        for question in questions:
-            if not isinstance(question.get("prompt"), str) or not question["prompt"].strip():
+        if maximum is not None and len(questions) > maximum:
+            return f"need no more than {maximum} questions"
+        for position, question in enumerate(questions, start=1):
+            if not isinstance(question, dict):
+                return f"question {position} must be one JSON object"
+            unknown_question = set(question) - {"prompt", "options", "correct"}
+            if unknown_question:
+                return f"question {position} has unknown fields: {sorted(unknown_question)}"
+            if (
+                not isinstance(question.get("prompt"), str)
+                or not question["prompt"].strip()
+                or len(question["prompt"]) > 1_000
+            ):
                 return "a question is missing its prompt"
             options = question.get("options")
             if not isinstance(options, list) or len(options) != 4:
                 return "each question needs exactly 4 options"
             if not all(isinstance(o, str) and o.strip() for o in options):
                 return "empty option"
+            if any(len(option) > 500 for option in options):
+                return "an answer option exceeds the safe output limit"
+            normalised = [
+                re.sub(r"^[A-Da-d][).: ]+\s*", "", option).strip().casefold()
+                for option in options
+            ]
+            if len(normalised) != len(set(normalised)):
+                return "answer options must be unique"
             if question.get("correct") not in ("A", "B", "C", "D"):
                 return 'correct must be "A", "B", "C" or "D"'
         return None
@@ -691,30 +742,29 @@ def check_quiz(minimum: int):
     return check
 
 
-QUESTION_SHAPE = (
-    "Return exactly this JSON shape:\n"
-    "{\n"
-    '  "questions": [\n'
-    '    {"prompt": "the question?", "options": ["first", "second", "third", "fourth"], "correct": "A"}\n'
-    "  ]\n"
-    "}\n\n"
-    'Rules: 4 options each, exactly one correct, "correct" is the letter of the correct '
-    "option (A = first, B = second, C = third, D = fourth). Options must NOT start with "
-    "letter labels. Spread the correct letters around - not all the same. "
-    "No trick questions about page numbers or formatting.\n\n"
-)
-
-
 def lecture_text(title: str, segments: list[dict]) -> str:
-    """Everything the lecturer actually says, as the quiz's source of truth."""
-    return f"Lecture: {title}\n\n" + "\n\n".join(seg["text"] for seg in segments)
+    """Everything the lecturer says, isolated as untrusted downstream data."""
+    return quote_untrusted_data(
+        {
+            "lecture_title": title,
+            "narration": [
+                str(segment.get("text") or "")
+                for segment in segments
+                if isinstance(segment, dict)
+            ],
+        },
+        label="lecture-evidence",
+    )
 
 
 def ask_questions(prompt: str, count: int, source: str, minimum: int | None = None) -> list[dict]:
     # Accept a short reply rather than failing a whole course build — a 3-minute
     # lecture honestly supports about 5 distinct easy questions, not always 8.
     data = ask_json(
-        prompt, QUIZ_SYSTEM, max(1800, 300 + 160 * count), check_quiz(minimum or max(1, count - 2))
+        prompt,
+        QUIZ_SYSTEM,
+        max(1800, 300 + 160 * count),
+        check_quiz(minimum or max(1, count - 2), count),
     )
 
     # The exam system's shape: options carry the letter label, correct_option is
@@ -744,13 +794,16 @@ def generate_quiz(
     # 1) The bulk of the bank: questions a student who WATCHED the lecture finds
     #    easy — every answer must have been said out loud by the lecturer.
     taught = ask_questions(
-        f'Write {shape["lecture_qs"]} multiple-choice questions testing the TOPICS this lecturer '
-        "covered. A student who understood the lecture must be able to answer every one; do not "
-        "ask about anything the lecture does not cover. Test the concept, not the wording: never "
-        "quote the lecturer's sentences verbatim, never ask what the lecturer 'said' or "
-        "'mentioned', and never turn a sentence into a fill-in-the-blank. Plain questions about "
-        "the subject matter itself.\n\n" + QUESTION_SHAPE +
-        "The lecture:\n" + lecture_text(title, segments),
+        _QUIZ_BANK_PROMPT.render_user(
+            question_count=shape["lecture_qs"],
+            source_kind="lecture-grounded",
+            task_guidance=(
+                "Test concepts actually covered by the lecturer. A learner who understood "
+                "the lecture can answer every item. Test subject matter rather than wording; "
+                "do not quote narration, ask what was 'said', or use fill-in-the-blank tricks."
+            ),
+            evidence=lecture_text(title, segments),
+        ),
         shape["lecture_qs"],
         "lecture",
         # a full quiz paper must be coverable by lecturer-taught questions
@@ -759,10 +812,19 @@ def generate_quiz(
 
     # 2) The small self-study tail: from the week's wider pages, beyond the slides.
     homework = ask_questions(
-        f'Write {shape["self_qs"]} multiple-choice SELF-STUDY questions for the week on '
-        f'"{title}", using ONLY these textbook pages. Pick details a short lecture would not '
-        "have covered - the student is expected to have read the pages themselves.\n\n"
-        + QUESTION_SHAPE + "Textbook pages:\n" + source_block(pages),
+        _QUIZ_BANK_PROMPT.render_user(
+            question_count=shape["self_qs"],
+            source_kind="self-study",
+            task_guidance=(
+                "Use only the textbook pages. Prefer grounded details beyond the short "
+                "lecture that a learner is expected to read independently."
+            ),
+            evidence=(
+                quote_untrusted_data(title, label="lecture-title")
+                + "\n\n"
+                + source_block(pages)
+            ),
+        ),
         shape["self_qs"],
         "self_study",
     )
@@ -947,10 +1009,15 @@ def generate_and_store_section(
         for slide in (slides.get("slides") or [])
         if isinstance(slide, dict) and str(slide.get("heading") or "").strip()
     ]
+    def complete_section(prompt: str) -> str:
+        roles = split_prompt_roles(prompt)
+        if roles is None:
+            raise ValueError("section prompt is missing its trusted role boundary")
+        system, user_task = roles
+        return complete(user_task, system=system, max_tokens=4000).text
+
     run = generate_section_pack(
-        llm=lambda prompt: complete(
-            prompt, system=_SECTION_PROMPT.system, max_tokens=4000
-        ).text,
+        llm=complete_section,
         identity=identity,
         tool_context=ToolContext(),
         focus=focus,
