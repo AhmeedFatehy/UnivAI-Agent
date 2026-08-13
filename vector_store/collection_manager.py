@@ -256,28 +256,34 @@ def delete_document(
     elif (grants is None) != (registry is None):
         raise ValueError("grants and registry must be provided together")
 
-    # Count before delete for reporting
-    before = client.count(
-        collection_name=name,
-        count_filter=models.Filter(
-            must=[
-                models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
-                models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id)),
-            ]
-        ),
-    ).count
-
-    client.delete(
-        collection_name=name,
-        points_selector=models.FilterSelector(
-            filter=models.Filter(
+    # A learner may remove a pending upload before the first collection exists;
+    # that is already a successful zero-vector state. Otherwise wait for Qdrant
+    # to acknowledge the tenant-and-document-filtered deletion before reporting
+    # success to the app.
+    before = 0
+    if client.collection_exists(collection_name=name):
+        before = client.count(
+            collection_name=name,
+            count_filter=models.Filter(
                 must=[
                     models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
                     models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id)),
                 ]
-            )
-        ),
-    )
+            ),
+        ).count
+
+        client.delete(
+            collection_name=name,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
+                        models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id)),
+                    ]
+                )
+            ),
+            wait=True,
+        )
 
     if grants is not None and registry is not None:
         from cache.authorization import revoke_document

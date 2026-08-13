@@ -193,3 +193,5 @@ def test_legacy_formatted_retrieval_never_returns_raw_delimiters(monkeypatch):
 
     assert "&lt;/untrusted-data&gt;" in rendered
     assert rendered.count("</untrusted-data>") == 1
+    assert "univai.rag.retrieved-passage" in rendered
+    assert "&quot;schema_version&quot;: &quot;1.0.0&quot;" in rendered

@@ -1,15 +1,17 @@
-from qdrant_client import QdrantClient, models
+from qdrant_client import models
 from fastembed import TextEmbedding, SparseTextEmbedding
 import uuid
 from load_documents import load_and_split_pdf
+from vector_store.qdrant_client import get_qdrant_client
 
 def setup_qdrant_collection(chunks):
     """Setup Qdrant collection using native client with dense + sparse vectors.
     
     Uses FastEmbed for generating embeddings locally.
     """
-    # TODO: Initialize Native Qdrant Client
-    client = QdrantClient(url="http://localhost:6333")
+    # Reuse the configured singleton so remote deployments receive the same
+    # URL and API-key authentication as the production retrieval pipeline.
+    client = get_qdrant_client()
 
     # TODO: Initialize embedding models (FastEmbed)
     dense_embedding_model = "jinaai/jina-embeddings-v2-base-en"  # e.g., "jinaai/jina-embeddings-v2-base-en"

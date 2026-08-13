@@ -24,6 +24,9 @@ from retrieval.query_transform import decompose_query
 
 logger = logging.getLogger(__name__)
 
+RETRIEVED_PASSAGE_SCHEMA = "univai.rag.retrieved-passage"
+RETRIEVED_PASSAGE_SCHEMA_VERSION = "1.0.0"
+
 
 def retrieve(
     query: str,
@@ -239,7 +242,12 @@ def retrieve_formatted(
         # of exposing raw retrieved text as apparent instructions.
         parts.append(
             quote_untrusted_data(
-                {"citation": doc["citation"], "content": doc["content"]},
+                {
+                    "schema_name": RETRIEVED_PASSAGE_SCHEMA,
+                    "schema_version": RETRIEVED_PASSAGE_SCHEMA_VERSION,
+                    "citation": doc["citation"],
+                    "content": doc["content"],
+                },
                 label="retrieved-passage",
             )
         )

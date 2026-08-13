@@ -4,6 +4,7 @@ Exposes RAG capabilities as tools for agents over HTTP.
 """
 import os
 import json
+import logging
 import re
 import sys
 from pathlib import Path
@@ -17,11 +18,14 @@ from runtime import REPOSITORY_ROOT, RuntimeMode, runtime_mode, standalone_root
 from retrieval.pipeline import retrieve_formatted
 from document_processing.loaders import load_document
 from document_processing.chunking import chunk_documents
+from document_processing.metadata import stable_document_id
 from document_processing.tenant_jobs import INGESTION_JOBS
 from vector_store.indexing import index_chunks
 from vector_store.collection_manager import list_user_documents, delete_document
 from evaluation.metrics import evaluate_retrieval
 from tools.registry import TOOL_REGISTRY, TOOL_SCHEMA_VERSION, call_tool
+
+logger = logging.getLogger(__name__)
 
 #: Output budget for programme planning. The curriculum agent extracts up to
 #: DEFAULT_MAX_TOPICS (8) topics, each with a summary, keywords and cited
@@ -118,8 +122,12 @@ def retrieve_context(
             use_reranking=use_reranking,
             use_query_transform=use_query_transform
         )
-    except Exception as e:
-        return f"Error during retrieval: {str(e)}"
+    except Exception as error:
+        # Operational failures are MCP failures, not zero-evidence answers.
+        # Returning an "Error ..." string with HTTP 200 made downstream clients
+        # parse it as no passages and tell learners the book lacked the answer.
+        logger.exception("Legacy retrieval failed")
+        raise RuntimeError("Retrieval is temporarily unavailable.") from error
 
 
 def _ingest_file_sync(file_path: str, user_id: str) -> str:
@@ -218,6 +226,48 @@ def remove_document(user_id: str, document_id: str) -> str:
         return f"Error deleting document: {str(e)}"
 
 
+def _remove_collection_document_sync(
+    user_id: str,
+    collection_id: str,
+    source_filename: str,
+) -> str:
+    """Resolve the deterministic index ID and delete only this tenant's copy."""
+    document_id = stable_document_id(collection_id, source_filename)
+    deleted = delete_document(user_id, document_id)
+    return (
+        f"Successfully deleted document '{document_id}'. "
+        f"Removed {deleted} chunks."
+    )
+
+
+@mcp.tool()
+async def remove_collection_document(
+    user_id: str,
+    collection_id: str,
+    source_filename: str,
+) -> str:
+    """Delete one collection upload without accepting a caller-supplied index ID.
+
+    The document ID is derived by the same canonical function ingestion uses,
+    and Qdrant deletion still requires both that ID and ``user_id``. Running on
+    the tenant's ingestion lane also prevents a concurrent upload for the same
+    learner from restoring chunks after the delete finishes.
+    """
+    try:
+        tenant = (user_id or "").strip()
+        if not _TENANT_ID_RE.fullmatch(tenant):
+            raise ValueError("invalid tenant identifier")
+        return await INGESTION_JOBS.run(
+            tenant,
+            _remove_collection_document_sync,
+            tenant,
+            collection_id,
+            source_filename,
+        )
+    except Exception as e:
+        return f"Error deleting document: {str(e)}"
+
+
 def _ingest_collection_sync(file_paths: list[str], collection_id: str, user_id: str) -> str:
     """Ingest several books into one collection, tolerating per-book failure.
 
@@ -302,8 +352,9 @@ def retrieve_grounded_context(
             },
         )
         return context.model_dump_json(indent=2)
-    except Exception as e:
-        return f"Error during grounded retrieval: {str(e)}"
+    except Exception as error:
+        logger.exception("Grounded retrieval failed")
+        raise RuntimeError("Grounded retrieval is temporarily unavailable.") from error
 
 
 def _create_programme_plan_sync(

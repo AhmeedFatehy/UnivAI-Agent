@@ -7,13 +7,18 @@ from functools import lru_cache
 from qdrant_client import QdrantClient
 from fastembed import TextEmbedding, SparseTextEmbedding
 
-from config import QDRANT_URL, DENSE_EMBEDDING_MODEL, SPARSE_EMBEDDING_MODEL
+from config import (
+    DENSE_EMBEDDING_MODEL,
+    QDRANT_API_KEY,
+    QDRANT_URL,
+    SPARSE_EMBEDDING_MODEL,
+)
 
 
 @lru_cache(maxsize=1)
 def get_qdrant_client() -> QdrantClient:
     """Return a singleton Qdrant client."""
-    return QdrantClient(url=QDRANT_URL)
+    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 
 @lru_cache(maxsize=1)

@@ -8,6 +8,7 @@ import os
 
 # ── Qdrant Configuration ──────────────────────────────────────────────
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip() or None
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "course_materials")
 
 # ── Embedding Models (FastEmbed — local, no API key needed) ───────────

@@ -26,6 +26,7 @@ import threading
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 AGENT_ROOT = Path(__file__).resolve().parents[1]
 if str(AGENT_ROOT) not in sys.path:
@@ -948,14 +949,26 @@ def write_quiz(
     quiz: list[dict],
     book_id: int | None = None,
 ) -> None:
-    payload = {"week": week, "title": title.strip(), "questions": quiz}
+    resolved_book_id = _book_for_student(sid, book_id)
+    # Assessment banks are learner-owned even when the lecture was adopted
+    # from a content-addressed donor. The generation id proves this payload was
+    # materialized for this learner instead of copied verbatim.
+    payload = {
+        "schema_version": "learner-assessment-bank-v1",
+        "owner_student_id": sid,
+        "owner_book_id": resolved_book_id,
+        "generation_id": str(uuid4()),
+        "week": week,
+        "title": title.strip(),
+        "questions": quiz,
+    }
     execute(
         """UPDATE lecture_artifacts
               SET quiz_payload = %s::jsonb, updated_at = CURRENT_TIMESTAMP
             WHERE book_id = %s AND student_id = %s AND week = %s""",
         (
             json.dumps(payload, ensure_ascii=False),
-            _book_for_student(sid, book_id),
+            resolved_book_id,
             sid,
             week,
         ),
@@ -1188,7 +1201,21 @@ def valid_lecture_checkpoint(
 def valid_quiz_checkpoint(sid: str, week: int, book_id: int | None = None) -> bool:
     row = lecture_artifact(sid, week, book_id)
     quiz = row.get("quiz_payload") if row else None
-    return bool(quiz and isinstance(quiz.get("questions"), list) and quiz["questions"])
+    resolved_book_id = (
+        int(row["book_id"])
+        if row and row.get("book_id") is not None
+        else book_id
+    )
+    return bool(
+        isinstance(quiz, dict)
+        and quiz.get("schema_version") == "learner-assessment-bank-v1"
+        and quiz.get("owner_student_id") == sid
+        and quiz.get("owner_book_id") == resolved_book_id
+        and isinstance(quiz.get("generation_id"), str)
+        and quiz["generation_id"].strip()
+        and isinstance(quiz.get("questions"), list)
+        and quiz["questions"]
+    )
 
 
 def valid_slides_checkpoint(sid: str, week: int, book_id: int | None = None) -> bool:
@@ -1236,9 +1263,10 @@ def prepare_generation_manifest(
 # that built it, so when both match a finished course the content is already
 # correct for the new learner and is copied instead of regenerated.
 #
-# Copied: lectures, narration, slides, quizzes, section packs — the teaching.
-# Never copied: attendance, exam attempts, scores. Those are keyed by student
-# and stay the learner's own, which is the whole point of separating them.
+# Copied: lectures, narration, slides, section packs — shared teaching assets.
+# Never copied: quiz banks, cumulative papers, attendance, attempts, or scores.
+# Assessments are regenerated and stamped for the adopting learner after the
+# teaching assets land, while the expensive lecture/slide work stays reused.
 
 
 def normalize_reused_plan(plan: dict) -> dict:
@@ -1310,8 +1338,7 @@ def find_reusable_course(
             """SELECT count(*) AS ready FROM lecture_artifacts
                 WHERE book_id = %s
                   AND jsonb_array_length(COALESCE(lecture_payload->'slides','[]'::jsonb)) > 0
-                  AND jsonb_array_length(COALESCE(script_payload->'segments','[]'::jsonb)) > 0
-                  AND jsonb_array_length(COALESCE(quiz_payload->'questions','[]'::jsonb)) > 0""",
+                  AND jsonb_array_length(COALESCE(script_payload->'segments','[]'::jsonb)) > 0""",
             (donor["id"],),
         )
         if int((complete_weeks or {}).get("ready") or 0) < total_weeks:
@@ -1381,7 +1408,7 @@ def adopt_course(sid: str, book_id: int, donor: dict) -> int:
     donor_id = int(donor["id"])
     weeks = fetch_all(
         """SELECT artifact_id::text AS artifact_id, week, title, lecture_payload,
-                  script_payload, slides_payload, quiz_payload
+                  script_payload, slides_payload
              FROM lecture_artifacts WHERE book_id = %s ORDER BY week""",
         (donor_id,),
     )
@@ -1399,7 +1426,7 @@ def adopt_course(sid: str, book_id: int, donor: dict) -> int:
             SELECT generated_id, %s, %s, %s, %s, %s::jsonb,
                    (%s::jsonb - 'lectureId')
                      || jsonb_build_object('lectureId', generated_id::text),
-                   %s::jsonb, %s::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                   %s::jsonb, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
               FROM (SELECT gen_random_uuid() AS generated_id) generated
             ON CONFLICT (book_id, week) DO UPDATE SET
               student_id = EXCLUDED.student_id,
@@ -1408,7 +1435,17 @@ def adopt_course(sid: str, book_id: int, donor: dict) -> int:
               script_payload = (EXCLUDED.script_payload - 'lectureId')
                 || jsonb_build_object('lectureId', lecture_artifacts.artifact_id::text),
               slides_payload = EXCLUDED.slides_payload,
-              quiz_payload = EXCLUDED.quiz_payload,
+              quiz_payload = CASE
+                WHEN lecture_artifacts.quiz_payload->>'schema_version'
+                       = 'learner-assessment-bank-v1'
+                 AND lecture_artifacts.quiz_payload->>'owner_student_id'
+                       = EXCLUDED.student_id
+                 AND lecture_artifacts.quiz_payload->>'owner_book_id'
+                       = EXCLUDED.book_id::text
+                 AND COALESCE(lecture_artifacts.quiz_payload->>'generation_id', '') <> ''
+                THEN lecture_artifacts.quiz_payload
+                ELSE NULL
+              END,
               updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -1419,22 +1456,18 @@ def adopt_course(sid: str, book_id: int, donor: dict) -> int:
                 json.dumps(row["lecture_payload"], ensure_ascii=False),
                 json.dumps(row["script_payload"], ensure_ascii=False),
                 json.dumps(row["slides_payload"], ensure_ascii=False),
-                json.dumps(row["quiz_payload"], ensure_ascii=False)
-                if row.get("quiz_payload")
-                else None,
             ),
         )
         register_week_artifacts(sid, week, book_id)
-        for stage in ("lecture", "quiz"):
-            mark_milestone(
-                book_id,
-                sid,
-                week,
-                stage,
-                "ready",
-                message="Adopted from an identical book",
-                artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}",
-            )
+        mark_milestone(
+            book_id,
+            sid,
+            week,
+            "lecture",
+            "ready",
+            message="Adopted from an identical book",
+            artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}",
+        )
         saved = lecture_artifact(sid, week, book_id)
         if saved and _reuse_slidev_cache(row["artifact_id"], str(saved["artifact_id"])):
             mark_milestone(
@@ -1667,9 +1700,56 @@ def regenerate_quizzes(
         script = row.get("script_payload") if row else None
         if not isinstance(script, dict):
             raise RuntimeError(f"week {week} lecture checkpoint is missing")
-        progress(book_id, f"Rewriting quiz {week} of {total_weeks} — “{script['title']}”…")
+        message = (
+            f"Writing learner assessment bank {week} of {total_weeks} "
+            f"— “{script['title']}”…"
+        )
+        progress(book_id, message)
+        mark_milestone(book_id, sid, week, "quiz", "running", message=message)
         quiz = generate_quiz(script["title"], script["segments"], week_pages)
         write_quiz(sid, week, script["title"], quiz, book_id)
+        mark_milestone(
+            book_id,
+            sid,
+            week,
+            "quiz",
+            "ready",
+            message="Learner-owned assessment bank saved",
+            artifact_ref=f"db:lecture_artifacts:{book_id}:week:{week}:quiz",
+        )
+        register_week_artifacts(sid, week, book_id)
+
+
+def assessment_weeks_for_plan(
+    plan: SemesterWeekPlan,
+    pdf_path: Path,
+) -> list[tuple[SemesterWeek, list[tuple[int, str]]]]:
+    """Bind an adopted plan to this upload's pages for fresh assessments."""
+    pages = read_pages(pdf_path)
+    if not pages:
+        raise RuntimeError("no readable text in the book - is it scanned images?")
+    return [(week, pages_for_week(week, pages)) for week in plan.weeks]
+
+
+def adopt_course_with_learner_assessments(
+    sid: str,
+    book_id: int,
+    donor: dict,
+    plan: SemesterWeekPlan,
+    pdf_path: Path,
+) -> int:
+    """Reuse teaching, then generate only this learner's missing quiz banks."""
+    adopted = adopt_course(sid, book_id, donor)
+    if not adopted:
+        return 0
+    missing = [
+        item
+        for item in assessment_weeks_for_plan(plan, pdf_path)
+        if not valid_quiz_checkpoint(sid, item[0].week, book_id)
+    ]
+    if missing:
+        regenerate_quizzes(sid, book_id, missing)
+    return adopted
 
 
 def main() -> int:
@@ -1795,7 +1875,20 @@ def main() -> int:
         if published_course_resume:
             total_weeks = saved_total
             page_count = int(book.get("pages") or 0)
-            weeks = []
+            plan = SemesterWeekPlan.model_validate(
+                normalize_reused_plan(book["semester_plan"])
+            )
+            # Payloads written before learner ownership was enforced are not
+            # trusted checkpoints. A resume keeps the lectures but rebuilds
+            # every assessment bank from this learner's own upload.
+            weeks = (
+                []
+                if all(
+                    valid_quiz_checkpoint(sid, week.week, book_id)
+                    for week in plan.weeks
+                )
+                else assessment_weeks_for_plan(plan, pdf_path)
+            )
             resume_artifacts = True
             message = f"Reusing {total_weeks} published lecture checkpoints…"
             update_book_state(book_id, "generating", "resuming", message)
@@ -1891,7 +1984,20 @@ def main() -> int:
                 message = f"Found this book already taught — reusing {donor['total_weeks']} weeks…"
                 update_book_state(book_id, "generating", "adopting", message)
                 progress(book_id, message)
-                adopted = adopt_course(sid, book_id, donor)
+                adopted_plan = SemesterWeekPlan.model_validate(
+                    normalize_reused_plan(
+                        (plan_row or {}).get("semester_plan")
+                        or donor["semester_plan"]
+                    )
+                )
+                active_stage = "quiz"
+                adopted = adopt_course_with_learner_assessments(
+                    sid,
+                    book_id,
+                    donor,
+                    adopted_plan,
+                    pdf_path,
+                )
                 if adopted:
                     total_weeks = adopted
                     execute(
@@ -1904,8 +2010,8 @@ def main() -> int:
                         book_id,
                         "ready",
                         "complete",
-                        f"Course ready — {core_ready}/{total_weeks} lectures reused "
-                        "from an identical book.",
+                        f"Course ready — {core_ready}/{total_weeks} lectures reused; "
+                        "learner assessments generated.",
                     )
                     warm_narration_cache(book_id)
                     print(
@@ -1921,17 +2027,6 @@ def main() -> int:
 
         if quizzes_only:
             regenerate_quizzes(sid, book_id, weeks)
-            for planned_week, _week_pages in weeks:
-                mark_milestone(
-                    book_id,
-                    sid,
-                    planned_week.week,
-                    "quiz",
-                    "ready",
-                    message="Quiz checkpoint rewritten",
-                    artifact_ref=f"db:lecture_artifacts:{book_id}:week:{planned_week.week}:quiz",
-                )
-                register_week_artifacts(sid, planned_week.week, book_id)
             refresh_book_counts(book_id)
             update_book_state(
                 book_id,

@@ -162,11 +162,18 @@ def test_lecture_checkpoint_requires_database_payloads_and_slidev_cache(monkeypa
         "script_payload": {"segments": [{"text": "Saved narration"}]},
         "lecture_payload": {"slides": [{"heading": "Saved"}]},
         "slides_payload": {"slides": [{"heading": "Saved"}]},
-        "quiz_payload": {"questions": [{"stem": "Saved question"}]},
+        "book_id": 8,
+        "quiz_payload": {
+            "schema_version": "learner-assessment-bank-v1",
+            "owner_student_id": "student-1",
+            "owner_book_id": 8,
+            "generation_id": "learner-generation",
+            "questions": [{"stem": "Saved question"}],
+        },
     })
 
     assert lecture_gen.valid_lecture_checkpoint("student-1", 1) is True
-    assert lecture_gen.valid_quiz_checkpoint("student-1", 1) is True
+    assert lecture_gen.valid_quiz_checkpoint("student-1", 1, 8) is True
     assert lecture_gen.valid_slides_checkpoint("student-1", 1) is True
 
 

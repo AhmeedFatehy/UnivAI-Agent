@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -237,8 +238,8 @@ def test_reused_slidev_cache_is_rekeyed_without_mutating_donor(monkeypatch, tmp_
     assert donor_id in (donor / "assets" / "app.js").read_text(encoding="utf-8")
 
 
-def test_adoption_copies_the_teaching_and_rekeys_the_identity(monkeypatch):
-    """The lecture arrives byte-identical under the adopting learner's own id."""
+def test_adoption_copies_teaching_but_never_the_donors_assessment(monkeypatch):
+    """The lecture is shared; the adopter's quiz slot is deliberately empty."""
     donor_week = {
         "artifact_id": "11111111-1111-4111-8111-111111111111",
         "week": 1,
@@ -285,17 +286,96 @@ def test_adoption_copies_the_teaching_and_rekeys_the_identity(monkeypatch):
     assert params[0] == 8 and params[1] == "S-2026-000005"
     # ...carries the donor's teaching unchanged...
     assert json.loads(params[4]) == donor_week["lecture_payload"]
-    assert json.loads(params[7]) == donor_week["quiz_payload"]
+    # ...but never carries the donor's questions or marks quiz ready.
+    assert donor_week["quiz_payload"]["questions"][0]["prompt"] not in repr(params)
+    assert "learner-assessment-bank-v1" in insert
+    assert "ELSE NULL" in insert
     # ...and never inherits the donor's lecture identity.
     assert "- 'lectureId'" in insert
     assert "gen_random_uuid()" in insert
     assert {stage for _week, stage, _status in milestones} == {
         "lecture",
-        "quiz",
         "slides",
         "audio",
     }
     assert all(status == "ready" for _week, _stage, status in milestones)
+
+
+def test_each_learner_gets_a_separately_owned_assessment_payload(monkeypatch):
+    writes: list[tuple[str, tuple]] = []
+    monkeypatch.setattr(lecture_gen, "execute", lambda sql, params: writes.append((sql, params)))
+    monkeypatch.setattr(
+        lecture_gen,
+        "_book_for_student",
+        lambda sid, book_id=None: int(book_id),
+    )
+    questions = [{"prompt": "What is atomicity?", "type": "mcq"}]
+
+    lecture_gen.write_quiz("S-2026-000005", 1, "Transactions", questions, 8)
+    lecture_gen.write_quiz("S-2026-000006", 1, "Transactions", questions, 9)
+
+    first = json.loads(writes[0][1][0])
+    second = json.loads(writes[1][1][0])
+    assert first["owner_student_id"] == "S-2026-000005"
+    assert first["owner_book_id"] == 8
+    assert second["owner_student_id"] == "S-2026-000006"
+    assert second["owner_book_id"] == 9
+    assert first["generation_id"] != second["generation_id"]
+    assert first["questions"] == second["questions"] == questions
+
+
+def test_quiz_checkpoint_fails_closed_for_another_learner(monkeypatch):
+    monkeypatch.setattr(
+        lecture_gen,
+        "lecture_artifact",
+        lambda sid, week, book_id=None: {
+            "book_id": 8,
+            "quiz_payload": {
+                "schema_version": "learner-assessment-bank-v1",
+                "owner_student_id": "S-2026-000004",
+                "owner_book_id": 7,
+                "generation_id": "donor-generation",
+                "questions": [{"prompt": "Donor question"}],
+            },
+        },
+    )
+
+    assert lecture_gen.valid_quiz_checkpoint("S-2026-000005", 1, 8) is False
+
+
+def test_adoption_generates_only_missing_learner_assessments(monkeypatch, tmp_path):
+    weeks = [
+        (SimpleNamespace(week=1), [(1, "week one")]),
+        (SimpleNamespace(week=2), [(2, "week two")]),
+    ]
+    regenerated: list[list[tuple]] = []
+    monkeypatch.setattr(lecture_gen, "adopt_course", lambda *args: 2)
+    monkeypatch.setattr(
+        lecture_gen,
+        "assessment_weeks_for_plan",
+        lambda plan, pdf_path: weeks,
+    )
+    monkeypatch.setattr(
+        lecture_gen,
+        "valid_quiz_checkpoint",
+        lambda sid, week, book_id=None: week == 1,
+    )
+    monkeypatch.setattr(
+        lecture_gen,
+        "regenerate_quizzes",
+        lambda sid, book_id, selected: regenerated.append(selected),
+    )
+
+    adopted = lecture_gen.adopt_course_with_learner_assessments(
+        "S-2026-000005",
+        8,
+        donor_row(),
+        object(),
+        tmp_path / "book.pdf",
+    )
+
+    assert adopted == 2
+    assert [[item[0].week for item in selected] for selected in regenerated] == [[2]]
 
 
 def test_adoption_never_copies_attendance_or_scores(monkeypatch):
