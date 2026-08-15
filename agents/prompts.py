@@ -52,6 +52,7 @@ class PromptId(str, Enum):
     RETRIEVAL_RELEVANCE = "evaluation/retrieval_relevance"
     ANSWER_GROUNDEDNESS = "evaluation/answer_groundedness"
     ASSESSMENT_QUALITY = "evaluation/assessment_quality"
+    ABSENCE_TRIAGE = "absence/triage"
     STRUCTURED_OUTPUT_REPAIR = "shared/structured_output_repair"
 
 
@@ -86,6 +87,7 @@ class PromptOperation(str, Enum):
     EVALUATION_RETRIEVAL = "evaluation.retrieval_relevance"
     EVALUATION_GROUNDEDNESS = "evaluation.answer_groundedness"
     EVALUATION_ASSESSMENT = "evaluation.assessment_quality"
+    ABSENCE_TRIAGE = "absence.triage"
     SHARED_REPAIR_JSON = "shared.repair_structured_output"
 
 

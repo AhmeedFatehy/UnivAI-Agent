@@ -30,6 +30,7 @@ routes:
   evaluation.retrieval_relevance: evaluation/retrieval_relevance
   evaluation.answer_groundedness: evaluation/answer_groundedness
   evaluation.assessment_quality: evaluation/assessment_quality
+  absence.triage: absence/triage
   shared.repair_structured_output: shared/structured_output_repair
 aliases:
   programme_planner: curriculum/programme_planner

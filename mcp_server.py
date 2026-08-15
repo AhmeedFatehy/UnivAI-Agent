@@ -478,6 +478,71 @@ def get_source_location(
 
 
 @mcp.tool()
+def triage_absence(case_facts: str, prior_answers: str = "") -> str:
+    """Strictly triage an absence claim for bounded learner follow-up or human review.
+
+    This tool never makes a final academic decision and never receives evidence
+    images. Its output is schema validated and carries prompt provenance.
+    """
+    try:
+        from agents.absence import triage_absence as run_triage
+        from guardrails.prompt_boundary import split_prompt_roles
+        from services.common.llm import TIMEOUT_QA_S, complete
+
+        served_model = [None]
+
+        def configured_llm(prompt: str) -> str:
+            roles = split_prompt_roles(prompt)
+            if roles is None:
+                raise ValueError("absence prompt is missing its trusted role boundary")
+            system, user_task = roles
+            result = complete(
+                user_task,
+                system=system,
+                max_tokens=900,
+                timeout_s=max(TIMEOUT_QA_S, 60),
+            )
+            served_model[0] = result.model_used
+            return result.text
+
+        result, prompt_id, prompt_version = run_triage(
+            configured_llm,
+            case_facts=case_facts,
+            prior_answers=prior_answers,
+        )
+        return json.dumps(
+            {
+                "validation_status": "valid",
+                "prompt_id": prompt_id,
+                "prompt_version": prompt_version,
+                "model_label": served_model[0],
+                "result": result.model_dump(mode="json"),
+            },
+            separators=(",", ":"),
+        )
+    except Exception:
+        logger.exception("Absence triage failed safely")
+        return json.dumps(
+            {
+                "validation_status": "fallback",
+                "prompt_id": "absence/triage",
+                "prompt_version": "1.0.0",
+                "model_label": None,
+                "result": {
+                    "recommendation": "human_review",
+                    "next_action": "pending_admin",
+                    "question_code": None,
+                    "policy_clause_ids": ["P07_INSUFFICIENT_DETAIL"],
+                    "sensitivity_flags": [],
+                    "admin_summary": "Automated triage was unavailable; a human must review the learner statement.",
+                    "confidence": 0.0,
+                },
+            },
+            separators=(",", ":"),
+        )
+
+
+@mcp.tool()
 def server_info() -> str:
     """Return basic info about the RAG MCP server and available tools."""
     return (
@@ -492,6 +557,7 @@ def server_info() -> str:
         "- retrieve_grounded_context: Cited passages, or an explicit refusal\n"
         "- create_programme_plan: Plan a programme through the agent graph\n"
         "- get_source_location: Resolve a citation back to book/page/section\n"
+        "- triage_absence: Strict recommendation or bounded follow-up for human absence review\n"
         "Supports multi-tenant isolation via user_id metadata filtering.\n"
         f"Typed tool contracts: {', '.join(sorted(TOOL_REGISTRY))} "
         f"(schema v{TOOL_SCHEMA_VERSION})."
