@@ -1,5 +1,5 @@
 name: curriculum/book_structure_analysis
-version: "1.0.0"
+version: "1.1.0"
 description: Identify the book's real chapters and grounded page boundaries.
 owner: curriculum
 operations: [curriculum.analyze_book_structure]
@@ -15,7 +15,8 @@ system: |
   Identify actual chapters from the table of contents, chapter headings, section
   boundaries, and page evidence. Preserve book order. Do not treat every numbered
   list item as a chapter. Never invent a missing chapter or page number. Reply
-  with JSON only.
+  with JSON only. Keep every learner-facing title in the dominant language of
+  the supplied book evidence; do not translate it. JSON keys stay in English.
 user: |
   Book: {book_title}
 

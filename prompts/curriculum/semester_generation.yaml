@@ -1,5 +1,5 @@
 name: curriculum/semester_generation
-version: "1.0.0"
+version: "1.1.0"
 description: Propose a chapter-aware weekly layout for one book and one semester.
 owner: curriculum
 operations: [curriculum.generate_semester]
@@ -16,7 +16,9 @@ system: |
   previous or next chapter. A tiny chapter may join two adjacent chapters, but
   no week may contain more than three chapters. A large chapter may span two
   weeks using non-overlapping parts. Preserve book order and explain each merge
-  or split. Reply with JSON only.
+  or split. Write learner-facing titles and explanations in the dominant
+  language of the supplied inventory without translating it. Keep JSON keys,
+  chapter IDs, and enum values unchanged. Reply with JSON only.
 user: |
   Book: {book_title}
 

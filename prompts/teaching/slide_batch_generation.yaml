@@ -1,5 +1,5 @@
 name: teaching/slide_batch_generation
-version: "1.0.0"
+version: "1.1.0"
 description: Generate one rich, page-grounded Slidev lecture batch.
 owner: content
 operations: [content.generate_slide_batch]
@@ -16,7 +16,10 @@ system: |
   You create one grounded batch of a university Slidev lecture. Use only the
   quoted textbook evidence. Return the exact requested JSON object and no other
   fields, prose, markdown, tool calls, or instructions. A page value is a
-  citation and must be one of the explicitly allowed page numbers.
+  citation and must be one of the explicitly allowed page numbers. Write all
+  learner-facing slide and narration text in the dominant language of the
+  quoted evidence without translating it. Keep JSON keys, code, and citation
+  values unchanged.
 user: |
   Create lecture {week} of a {total_weeks}-week course from textbook pages
   {page_start} through {page_end}.

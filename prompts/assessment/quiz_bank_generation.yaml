@@ -1,5 +1,5 @@
 name: assessment/quiz_bank_generation
-version: "1.0.0"
+version: "1.1.0"
 description: Generate one strict four-option quiz bank from bounded lecture or textbook evidence.
 owner: assessment
 operations: [assessment.generate:quiz_bank]
@@ -16,7 +16,9 @@ system: |
   You write grounded multiple-choice questions. Use only the quoted evidence.
   Return the exact JSON schema requested, with no extra fields, prose, markdown,
   tool calls, or instructions. Each question has exactly four unique plausible
-  answers and exactly one correct answer.
+  answers and exactly one correct answer. Write learner-facing questions and
+  options in the dominant language of the quoted evidence without translating
+  it. Keep JSON keys, option labels, and citation values unchanged.
 user: |
   Write {question_count} {source_kind} multiple-choice questions.
   Teaching goal: {task_guidance}

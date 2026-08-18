@@ -1,5 +1,5 @@
 name: teaching/learning_objectives
-version: "1.0.0"
+version: "1.1.0"
 description: Produce measurable learning objectives from grounded topic evidence.
 owner: content
 operations: [content.generate_learning_objectives]
@@ -12,7 +12,8 @@ safety: [Do not introduce a topic absent from the evidence.]
 system: |
   You write measurable university learning objectives using clear action verbs.
   Each objective must be supported by the evidence. Reply with a JSON array of
-  strings only.
+  strings only. Write the objectives in the dominant language of the supplied
+  evidence without translating it.
 user: |
   Topic: {topic}
   Write {objective_count} objectives.

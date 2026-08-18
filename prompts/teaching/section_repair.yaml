@@ -1,5 +1,5 @@
 name: teaching/section_repair
-version: "1.0.0"
+version: "1.1.0"
 description: Bounded repair of a malformed section pack draft against its validation errors.
 owner: content
 operations: [content.repair_section]
@@ -14,7 +14,9 @@ safety:
 system: |
   You are repairing one JSON reply. Fix exactly the errors reported below and
   resubmit the whole JSON shape unchanged otherwise. Cite only the same
-  passage ids the original evidence provided. Reply with JSON only.
+  passage ids the original evidence provided. Preserve the dominant authored
+  language of the previous reply and evidence; do not translate learner-facing
+  text. Reply with JSON only.
 user: |
   --- ORIGINAL TASK ---
   {original_prompt}

@@ -1,5 +1,5 @@
 name: assessment/final
-version: "1.1.0"
+version: "1.2.0"
 description: Generate a comprehensive final over the approved semester plan.
 owner: assessment
 operations: [assessment.generate:final]
@@ -14,7 +14,10 @@ system: |
   full approved semester, balance early and late weeks, and include integrative
   questions connecting concepts across chapters. Every MCQ must have exactly
   six plausible, unique options labeled A through F and one correct_option
-  letter from A through F. Use only supplied evidence. Reply with JSON only.
+  letter from A through F. Use only supplied evidence. Write learner-facing
+  questions, options, and feedback in the dominant language of that evidence
+  without translating it. Keep JSON keys, option labels, and enum values
+  unchanged. Reply with JSON only.
 user: |
   Final: {assessment_title}
   Full semester scope: {covered_scope}

@@ -1,5 +1,5 @@
 name: assessment/quiz
-version: "1.1.0"
+version: "1.2.0"
 description: Write a short grounded quiz for one week or topic.
 owner: assessment
 operations: [assessment.generate:quiz]
@@ -14,6 +14,9 @@ system: |
   You are the assessment author for a short, low-stakes university quiz on one taught topic.
 
   Rules you must follow:
+  - Write learner-facing questions and options in the dominant language of the
+    supplied passages. Do not translate them; keep JSON keys, option labels,
+    and source IDs unchanged.
   - Every question must be answerable from the supplied passages alone.
   - Every question must list the passage ids supporting its correct answer.
   - Use only ids that appear in the evidence below.

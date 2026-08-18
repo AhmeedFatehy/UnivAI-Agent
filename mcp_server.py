@@ -452,6 +452,116 @@ async def create_programme_plan(
     )
 
 
+def _generate_practice_assessment_sync(
+    topic_id: str,
+    topic_title: str,
+    topic_summary: str,
+    collection_id: str,
+    user_id: str,
+    document_ids: list[str] | None = None,
+    question_count: int = 5,
+) -> str:
+    """Generate one grounded, five-question low-stakes practice package."""
+
+    for model_input in (topic_title, topic_summary):
+        blocked = _screen_user_query(model_input)
+        if blocked is not None:
+            return json.dumps({"status": "refused", "error": blocked})
+    if question_count != 5:
+        return json.dumps({"status": "failed", "error": "Practice requires exactly five questions."})
+    try:
+        from agents.assessment import AssessmentAgent
+        from agents.manager import AgentRuntime
+        from agents.schemas import AgentName, Handoff, TaskRecord
+        from guardrails.prompt_boundary import split_prompt_roles
+        from services.common.llm import TIMEOUT_GENERATION_S, complete
+
+        def configured_llm(prompt: str) -> str:
+            roles = split_prompt_roles(prompt)
+            if roles is None:
+                raise ValueError("practice prompt is missing its trusted role boundary")
+            system, user_task = roles
+            return complete(
+                user_task,
+                system=system,
+                max_tokens=2_400,
+                timeout_s=TIMEOUT_GENERATION_S,
+            ).text
+
+        task = TaskRecord(
+            task_id=f"practice:{topic_id}",
+            agent=AgentName.ASSESSMENT,
+            objective=f"Generate five grounded practice questions for {topic_title}",
+        )
+        assessment = AssessmentAgent(AgentRuntime(llm=configured_llm)).run(
+            Handoff(
+                handoff_id=f"practice:{topic_id}",
+                from_agent=AgentName.MANAGER,
+                to_agent=AgentName.ASSESSMENT,
+                objective=task.objective,
+                collection_id=collection_id,
+                user_id=user_id,
+                payload={
+                    "topic_id": topic_id,
+                    "topic_title": topic_title,
+                    "topic_summary": topic_summary,
+                    "document_ids": document_ids or [],
+                },
+                constraints={
+                    "assessment_type": "practice",
+                    "question_count": 5,
+                    "covered_scope": [topic_title, topic_summary],
+                    "difficulty_distribution": "two easy, two medium, one challenging",
+                    "allowed_formats": ["mcq"],
+                    "evidence_limit": 8,
+                },
+            ),
+            task,
+        )
+        if assessment is None:
+            return json.dumps({
+                "status": "refused" if task.state.value == "refused" else "failed",
+                "error": task.error or "Practice generation was rejected.",
+            })
+        return json.dumps(
+            {
+                "status": "accepted",
+                "assessment": assessment.model_dump(mode="json"),
+                "prompt": task.prompts[-1].model_dump(mode="json") if task.prompts else None,
+                "model": task.servings[-1].model_dump(mode="json") if task.servings else None,
+            },
+            separators=(",", ":"),
+        )
+    except Exception:
+        logger.exception("Practice assessment generation failed safely")
+        return json.dumps({"status": "failed", "error": "Grounded practice generation failed safely."})
+
+
+@mcp.tool()
+async def generate_practice_assessment(
+    topic_id: str,
+    topic_title: str,
+    topic_summary: str,
+    collection_id: str,
+    user_id: str,
+    document_ids: list[str] | None = None,
+    question_count: int = 5,
+) -> str:
+    """Generate exactly five cited MCQs for one learner-owned lecture."""
+
+    return await INGESTION_JOBS.run(
+        user_id,
+        _generate_practice_assessment_sync,
+        topic_id,
+        topic_title,
+        topic_summary,
+        collection_id,
+        user_id,
+        document_ids,
+        question_count,
+    )
+
+
 @mcp.tool()
 def get_source_location(
     user_id: str, document_id: str, chunk_index: int | None = None
@@ -556,6 +666,7 @@ def server_info() -> str:
         "- ingest_collection: Index several books under one collection identity\n"
         "- retrieve_grounded_context: Cited passages, or an explicit refusal\n"
         "- create_programme_plan: Plan a programme through the agent graph\n"
+        "- generate_practice_assessment: Generate a cited five-question practice package\n"
         "- get_source_location: Resolve a citation back to book/page/section\n"
         "- triage_absence: Strict recommendation or bounded follow-up for human absence review\n"
         "Supports multi-tenant isolation via user_id metadata filtering.\n"

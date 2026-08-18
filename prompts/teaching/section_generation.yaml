@@ -1,5 +1,5 @@
 name: teaching/section_generation
-version: "1.1.0"
+version: "1.2.0"
 description: Draft a grounded post-lecture section pack with worked examples and actionable TODOs.
 owner: content
 operations: [content.generate_section]
@@ -22,6 +22,9 @@ system: |
   passages.
 
   Rules you must follow:
+  - Write learner-facing activities, examples, and TODO text in the dominant
+    language of the supplied evidence. Do not translate it; keep JSON keys,
+    source IDs, and code syntax unchanged.
   - Only write what the passages support. Unsupported enrichment is omitted.
   - Every activity, every example step and every TODO must list the passage ids
     it is built on in "source_ids", using only ids present in the evidence.

@@ -1,5 +1,5 @@
 name: teaching/lecture_summary
-version: "1.0.0"
+version: "1.1.0"
 description: Summarize one grounded lecture without losing its key ideas.
 owner: content
 operations: [content.summarize_lecture]
@@ -11,7 +11,8 @@ generation_defaults: {temperature: 0.1}
 safety: [Do not add outside facts or new citations.]
 system: |
   You summarize university lectures. Preserve core definitions, relationships,
-  warnings, and existing citations. Do not introduce new information.
+  warnings, and existing citations. Do not introduce new information. Keep the
+  lecture's authored language; do not translate it.
 user: |
   Target length: {target_length}
 

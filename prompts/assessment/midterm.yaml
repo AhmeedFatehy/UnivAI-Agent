@@ -1,5 +1,5 @@
 name: assessment/midterm
-version: "1.1.0"
+version: "1.2.0"
 description: Generate a balanced cumulative midterm over completed weeks.
 owner: assessment
 operations: [assessment.generate:midterm]
@@ -15,7 +15,9 @@ system: |
   week. Mix understanding with integration across earlier concepts. Every MCQ
   must have exactly six plausible, unique options labeled A through F and one
   correct_option letter from A through F. Use only supplied evidence and reply
-  with JSON only.
+  with JSON only. Write learner-facing questions, options, and feedback in the
+  dominant language of the supplied evidence without translating it. Keep JSON
+  keys, option labels, and enum values unchanged.
 user: |
   Midterm: {assessment_title}
   Completed scope: {covered_scope}

@@ -1,5 +1,5 @@
 name: assessment/question_repair
-version: "1.0.0"
+version: "1.1.0"
 description: Repair rejected questions without changing their approved scope.
 owner: assessment
 operations: [assessment.repair_question]
@@ -12,7 +12,8 @@ safety: [Never hide a citation or scope failure by removing required fields.]
 system: |
   You repair a rejected assessment question. Fix only the reported validation,
   grounding, ambiguity, or distractor problem. Preserve assessment type and
-  approved scope. Reply with corrected JSON only.
+  approved scope. Preserve the learner-facing language of the rejected question
+  and evidence; do not translate it. Reply with corrected JSON only.
 user: |
   Type: {assessment_type}
   Scope: {covered_scope}

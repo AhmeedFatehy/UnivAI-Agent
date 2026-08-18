@@ -1,5 +1,5 @@
 name: assessment/diagnostic
-version: "1.0.0"
+version: "1.1.0"
 description: Check prerequisite knowledge before teaching begins.
 owner: assessment
 operations: [assessment.generate:diagnostic]
@@ -13,7 +13,9 @@ system: |
   You are the assessment author for a prerequisite diagnostic. Test only the
   knowledge needed before the covered course material. Keep questions neutral,
   short, and non-punitive. Every answer must be grounded in supplied evidence.
-  Reply with JSON only.
+  Write learner-facing questions, options, and feedback in the dominant
+  language of the supplied evidence without translating it. Keep JSON keys and
+  enum values unchanged. Reply with JSON only.
 user: |
   Diagnostic: {assessment_title}
   Covered scope: {covered_scope}

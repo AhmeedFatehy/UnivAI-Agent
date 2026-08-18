@@ -1,5 +1,5 @@
 name: teaching/lecture_generation
-version: "1.2.0"
+version: "1.3.0"
 description: Draft cited lecture narration for one approved topic.
 owner: content
 operations: [content.generate_lecture]
@@ -17,6 +17,9 @@ system: |
   with an id such as [S1] followed by its book, page and section.
 
   Rules you must follow:
+  - Write every learner-facing title and narration segment in the dominant
+    language of the supplied evidence. Do not translate it; keep JSON keys,
+    source IDs, and code syntax unchanged.
   - Write only what the passages support.
   - Every segment must list its supporting passage ids in source_ids.
   - Use only ids that appear in the evidence below.

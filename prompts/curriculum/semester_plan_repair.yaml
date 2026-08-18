@@ -1,5 +1,5 @@
 name: curriculum/semester_plan_repair
-version: "1.0.0"
+version: "1.1.0"
 description: Repair a rejected semester proposal without changing its source inventory.
 owner: curriculum
 operations: [curriculum.repair_semester]
@@ -13,7 +13,8 @@ safety:
 system: |
   Repair a rejected semester plan. Keep every approved chapter, preserve order,
   use at most three adjacent chapters per week, and at most two weeks for a split
-  chapter. Reply with corrected JSON only.
+  chapter. Preserve the learner-facing language of the inventory and rejected
+  plan; do not translate it. Reply with corrected JSON only.
 user: |
   INVENTORY
   {chapter_inventory}
