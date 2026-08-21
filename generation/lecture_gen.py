@@ -1343,6 +1343,15 @@ def find_reusable_course(
         )
         if int((complete_weeks or {}).get("ready") or 0) < total_weeks:
             continue
+        complete_sections = fetch_one(
+            """SELECT count(DISTINCT week) AS ready FROM section_packs
+                WHERE course_id = %s
+                  AND week BETWEEN 1 AND %s
+                  AND pack_payload IS NOT NULL""",
+            (f"book-{donor['id']}", total_weeks),
+        )
+        if int((complete_sections or {}).get("ready") or 0) < total_weeks:
+            continue
         return donor
     return None
 
@@ -1353,23 +1362,13 @@ def course_reuse_allowed(sid: str, *, quizzes_only: bool, no_reuse: bool) -> boo
     Reuse is right for a learner meeting a book someone else has already been
     taught. It is wrong when an admin has explicitly asked to regenerate
     (``--no-reuse``), because returning a copy would make that request a silent
-    no-op, and wrong when the learner reshaped their curriculum, because the
-    existing course no longer describes what they approved.
+    no-op. ``find_reusable_course`` is the content-safety gate: it requires the
+    same book bytes, generation pipeline, normalized approved plan, and a
+    complete donor. Do not use ``plan_version`` here because selecting the
+    required weekly schedule also increments it without changing curriculum.
     """
-    if quizzes_only or no_reuse:
-        return False
-    return not learner_has_edited_curriculum(sid)
-
-
-def learner_has_edited_curriculum(sid: str) -> bool:
-    """A reshaped curriculum earns a real build, not somebody else's course."""
-    programme = fetch_one(
-        """SELECT plan_version FROM programmes
-            WHERE student_id = %s AND status = 'approved'
-            ORDER BY id DESC LIMIT 1""",
-        (sid,),
-    )
-    return bool(programme and int(programme.get("plan_version") or 1) > 1)
+    _ = sid  # Kept in the API to make the tenant-scoped decision explicit.
+    return not quizzes_only and not no_reuse
 
 
 def _reuse_slidev_cache(donor_artifact_id: str, artifact_id: str) -> bool:
@@ -1497,15 +1496,6 @@ def adopt_course(sid: str, book_id: int, donor: dict) -> int:
                 mark_milestone(
                     book_id, sid, week, "slides", "failed", message=str(error)[:400]
                 )
-        mark_milestone(
-            book_id,
-            sid,
-            week,
-            "audio",
-            "ready",
-            message="On-demand lecture voice ready",
-            artifact_ref="runtime:live-tts",
-        )
         adopted += 1
     adopt_section_packs(sid, book_id, donor_id)
     return adopted
@@ -1654,6 +1644,74 @@ def warm_narration_cache(book_id: int) -> bool:
     return True
 
 
+def demo_media_enabled() -> bool:
+    return os.getenv("LIVE_SESSION_TRANSPORT", "livekit").strip().lower() == "demo_media"
+
+
+def prepare_demo_media(sid: str, book_id: int) -> None:
+    """Synchronously publish the real browser media before the book is ready.
+
+    The renderer runs in the voice environment, then exits. The demo runtime
+    therefore loads no TTS model, while a learner can never see a completed
+    course whose current narration bundle is still missing.
+    """
+    script = ROOT / "UnivAI-live" / "prepare_demo_media.py"
+    candidates = [
+        ROOT / "UnivAI-live" / ".venv" / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        ),
+        ROOT / ".venv" / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        ),
+    ]
+    python = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if not script.is_file() or python is None:
+        raise RuntimeError(
+            "demo media renderer is unavailable; run project setup before generating the course"
+        )
+
+    message = "Rendering and validating the lecture audio and captions…"
+    update_book_state(book_id, "generating", "audio", message)
+    progress(book_id, message)
+    print(f"[lecture-gen] preparing demo media for {sid}", flush=True)
+    completed = subprocess.run(
+        [str(python), str(script), "--student", sid],
+        cwd=str(ROOT),
+        stdin=subprocess.DEVNULL,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"demo media preparation failed for account {sid} (exit {completed.returncode})"
+        )
+
+
+def finalize_narration(sid: str, book_id: int, total_weeks: int) -> None:
+    """Make the selected transport real, then publish its audio milestones."""
+    prepared_demo = demo_media_enabled()
+    if prepared_demo:
+        prepare_demo_media(sid, book_id)
+
+    for week in range(1, total_weeks + 1):
+        mark_milestone(
+            book_id,
+            sid,
+            week,
+            "audio",
+            "ready",
+            message=(
+                "Validated browser lecture media ready"
+                if prepared_demo
+                else "On-demand lecture voice ready"
+            ),
+            artifact_ref=("demo-media:validated" if prepared_demo else "runtime:live-tts"),
+        )
+    refresh_book_counts(book_id)
+    if not prepared_demo and total_weeks:
+        warm_narration_cache(book_id)
+
+
 def initialize_milestones(book_id: int, sid: str, total_weeks: int) -> None:
     mark_milestone(book_id, sid, 0, "plan", "ready", message="Course plan saved")
     execute(
@@ -1694,15 +1752,15 @@ def regenerate_quizzes(
 ) -> None:
     """Rewrite only quiz JSONB per week from the saved lecture scripts."""
     total_weeks = len(weeks)
-    for planned_week, week_pages in weeks:
+    for ordinal, (planned_week, week_pages) in enumerate(weeks, start=1):
         week = planned_week.week
         row = lecture_artifact(sid, week, book_id)
         script = row.get("script_payload") if row else None
         if not isinstance(script, dict):
             raise RuntimeError(f"week {week} lecture checkpoint is missing")
         message = (
-            f"Writing learner assessment bank {week} of {total_weeks} "
-            f"— “{script['title']}”…"
+            f"Writing learner assessment bank {ordinal} of {total_weeks} "
+            f"(week {week}) — “{script['title']}”…"
         )
         progress(book_id, message)
         mark_milestone(book_id, sid, week, "quiz", "running", message=message)
@@ -2005,6 +2063,9 @@ def main() -> int:
                                generation_stage = 'content', error = NULL WHERE id = %s""",
                         (total_weeks, book_id),
                     )
+                    active_week = 1
+                    active_stage = "audio"
+                    finalize_narration(sid, book_id, total_weeks)
                     core_ready, audio_ready = refresh_book_counts(book_id)
                     update_book_state(
                         book_id,
@@ -2013,7 +2074,6 @@ def main() -> int:
                         f"Course ready — {core_ready}/{total_weeks} lectures reused; "
                         "learner assessments generated.",
                     )
-                    warm_narration_cache(book_id)
                     print(
                         f"[lecture-gen] adopted {adopted} weeks from book {donor['id']}",
                         flush=True,
@@ -2187,40 +2247,29 @@ def main() -> int:
                 f"Published week {week} of {total_weeks} — {core_ready} ready to use.",
             )
 
-        # Live synthesizes narration from the database script. Readiness means
-        # the on-demand path is available; no per-learner audio folder is built.
-        for week in range(1, total_weeks + 1):
-            active_week = week
-            active_stage = "audio"
-            mark_milestone(
-                book_id,
-                sid,
-                week,
-                "audio",
-                "ready",
-                message="On-demand lecture voice ready",
-                artifact_ref="runtime:live-tts",
-            )
-            refresh_book_counts(book_id)
+        active_week = 1
+        active_stage = "audio"
+        finalize_narration(sid, book_id, total_weeks)
 
         core_ready, audio_ready = refresh_book_counts(book_id)
+        narration_label = (
+            "prepared narration files" if demo_media_enabled() else "narration runtimes"
+        )
         if audio_ready == total_weeks:
             final_status = "ready"
             final_stage = "complete"
             final_message = (
                 f"Course complete — {core_ready}/{total_weeks} lectures and "
-                f"{audio_ready}/{total_weeks} narration runtimes ready."
+                f"{audio_ready}/{total_weeks} {narration_label} ready."
             )
         else:
             final_status = "partial"
             final_stage = "paused"
             final_message = (
                 f"Course usable — {core_ready}/{total_weeks} lectures ready; "
-                f"{audio_ready}/{total_weeks} narration runtimes ready. Continue when convenient."
+                f"{audio_ready}/{total_weeks} {narration_label} ready. Continue when convenient."
             )
         update_book_state(book_id, final_status, final_stage, final_message)
-        if core_ready:
-            warm_narration_cache(book_id)
         print(
             json.dumps(
                 {

@@ -35,7 +35,7 @@ def donor_row(**overrides) -> dict:
     return row
 
 
-def install_db(monkeypatch, *, donors, complete_weeks=2):
+def install_db(monkeypatch, *, donors, complete_weeks=2, complete_sections=2):
     """Answer only the queries find_reusable_course actually issues."""
 
     def fetch_all(sql, params=None):
@@ -46,6 +46,8 @@ def install_db(monkeypatch, *, donors, complete_weeks=2):
     def fetch_one(sql, params=None):
         if "count(*) AS ready FROM lecture_artifacts" in sql:
             return {"ready": complete_weeks}
+        if "count(DISTINCT week) AS ready FROM section_packs" in sql:
+            return {"ready": complete_sections}
         return None
 
     monkeypatch.setattr(lecture_gen, "fetch_all", fetch_all)
@@ -142,6 +144,15 @@ def test_an_unfinished_donor_is_not_adopted(monkeypatch):
     )
 
 
+def test_a_donor_missing_a_section_is_not_adopted(monkeypatch):
+    install_db(monkeypatch, donors=[donor_row()], complete_sections=1)
+
+    assert (
+        lecture_gen.find_reusable_course("S-2026-000005", 8, "sha-abc", FINGERPRINT, PLAN)
+        is None
+    )
+
+
 def test_a_learner_without_a_plan_reuses_the_finished_donors_plan(monkeypatch):
     install_db(monkeypatch, donors=[donor_row()])
 
@@ -173,14 +184,16 @@ def test_regeneration_refuses_to_hand_back_an_existing_course(monkeypatch):
     ) is False
 
 
-def test_an_edited_curriculum_is_never_reused_even_without_the_flag(monkeypatch):
+def test_schedule_version_does_not_disable_exact_course_reuse(monkeypatch):
     monkeypatch.setattr(
-        lecture_gen, "fetch_one", lambda sql, params=None: {"plan_version": 2}
+        lecture_gen,
+        "fetch_one",
+        lambda sql, params=None: pytest.fail("plan_version is not content identity"),
     )
 
     assert lecture_gen.course_reuse_allowed(
         "S-2026-000005", quizzes_only=False, no_reuse=False
-    ) is False
+    ) is True
 
 
 def test_a_quiz_only_run_never_adopts(monkeypatch):
@@ -194,22 +207,6 @@ def test_a_quiz_only_run_never_adopts(monkeypatch):
     assert lecture_gen.course_reuse_allowed(
         "S-2026-000005", quizzes_only=True, no_reuse=False
     ) is False
-
-
-def test_an_edited_curriculum_earns_a_real_build(monkeypatch):
-    monkeypatch.setattr(
-        lecture_gen, "fetch_one", lambda sql, params=None: {"plan_version": 2}
-    )
-
-    assert lecture_gen.learner_has_edited_curriculum("S-2026-000005") is True
-
-
-def test_an_untouched_curriculum_may_adopt(monkeypatch):
-    monkeypatch.setattr(
-        lecture_gen, "fetch_one", lambda sql, params=None: {"plan_version": 1}
-    )
-
-    assert lecture_gen.learner_has_edited_curriculum("S-2026-000005") is False
 
 
 def test_reused_slidev_cache_is_rekeyed_without_mutating_donor(monkeypatch, tmp_path):
